@@ -1,0 +1,26 @@
+# Binary
+storageto
+storageto.exe
+
+# Build artifacts
+dist/
+*.tar.gz
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+coverage.out
+*.test
+
+# Local config (don't commit tokens)
+.env
