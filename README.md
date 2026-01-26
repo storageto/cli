@@ -118,19 +118,14 @@ The CLI stores a persistent identity token in `~/.config/storageto/token`. This:
 
 ## Development
 
-### Running locally
+### Building from source
 
 ```bash
-# Clone and build
 git clone https://github.com/ryanbadger/storage.to-cli.git
 cd storage.to-cli
-make build
-
-# Test against local API
-./storageto upload test.txt --api https://storage.to.test
-
-# Run tests
-make test
+make build      # Build binary
+make test       # Run tests
+make install    # Install to ~/go/bin
 ```
 
 ### Project structure
