@@ -212,6 +212,17 @@ func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL st
 func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp *api.InitUploadResponse, size int64) error {
 	u.log("Multipart upload: %d parts, %s each\n", initResp.TotalParts, humanSize(initResp.PartSize))
 
+	// Abort cleanup on cancellation
+	defer func() {
+		if ctx.Err() != nil && initResp.UploadID != "" {
+			// Best effort abort - use background context since main ctx is cancelled
+			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			u.client.AbortUpload(abortCtx, initResp.UploadID)
+			u.log("Cleaned up partial upload\n")
+		}
+	}()
+
 	// Track completed parts
 	var parts []api.Part
 	var partsMu sync.Mutex

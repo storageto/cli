@@ -195,6 +195,22 @@ func (c *Client) CreateCollection(ctx context.Context, req *CreateCollectionRequ
 	return &resp, nil
 }
 
+// AbortUpload aborts a multipart upload
+func (c *Client) AbortUpload(ctx context.Context, uploadID string) error {
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	err := c.post(ctx, "/api/upload/abort", map[string]string{"upload_id": uploadID}, &resp)
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
 // MarkCollectionReady marks a collection as ready
 func (c *Client) MarkCollectionReady(ctx context.Context, collectionID string) (*MarkCollectionReadyResponse, error) {
 	var resp MarkCollectionReadyResponse
