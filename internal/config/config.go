@@ -8,18 +8,21 @@ import (
 )
 
 const (
-	configDir   = ".config/storageto"
+	appName     = "storageto"
 	tokenFile   = "token"
 	tokenLength = 16 // 32 hex chars + "cli_" prefix = 36 chars total
 )
 
-// GetConfigDir returns the config directory path
+// GetConfigDir returns the platform-appropriate config directory path
+// - macOS: ~/Library/Application Support/storageto/
+// - Linux: ~/.config/storageto/
+// - Windows: %AppData%\storageto\
 func GetConfigDir() (string, error) {
-	home, err := os.UserHomeDir()
+	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, configDir), nil
+	return filepath.Join(configDir, appName), nil
 }
 
 // GetVisitorToken returns the persistent visitor token, creating one if needed

@@ -10,6 +10,7 @@ import (
 var (
 	apiURL  string
 	verbose bool
+	noToken bool
 )
 
 var rootCmd = &cobra.Command{
@@ -33,4 +34,5 @@ func Execute() {
 func init() {
 	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "https://storage.to", "API base URL")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
+	rootCmd.PersistentFlags().BoolVar(&noToken, "no-token", false, "Run without persistent identity token (fully anonymous)")
 }

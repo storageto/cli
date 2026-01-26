@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 
 var (
 	collection bool
+	jsonOutput bool
 )
 
 var uploadCmd = &cobra.Command{
@@ -35,6 +37,7 @@ Examples:
 func init() {
 	rootCmd.AddCommand(uploadCmd)
 	uploadCmd.Flags().BoolVarP(&collection, "collection", "c", false, "Create a collection for multiple files")
+	uploadCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output result as JSON")
 }
 
 func runUpload(cmd *cobra.Command, args []string) error {
@@ -84,10 +87,14 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	// Auto-collection for multiple files
 	asCollection := collection || len(files) > 1
 
-	// Get persistent visitor token
-	visitorToken, err := config.GetVisitorToken()
-	if err != nil {
-		return fmt.Errorf("failed to initialize: %w", err)
+	// Get visitor token (unless --no-token is set)
+	var visitorToken string
+	if !noToken {
+		var err error
+		visitorToken, err = config.GetVisitorToken()
+		if err != nil {
+			return fmt.Errorf("failed to initialize: %w", err)
+		}
 	}
 
 	// Create client and uploader
@@ -104,15 +111,20 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print result
-	fmt.Println()
-	if result.IsCollection {
-		fmt.Printf("Collection: %s\n", result.Collection.URL)
-		fmt.Printf("Expires:    %s\n", result.Collection.ExpiresAt)
+	if jsonOutput {
+		output, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(output))
 	} else {
-		fmt.Printf("URL:     %s\n", result.FileInfo.URL)
-		fmt.Printf("Raw:     %s\n", result.FileInfo.RawURL)
-		fmt.Printf("Size:    %s\n", result.FileInfo.HumanSize)
-		fmt.Printf("Expires: %s\n", result.FileInfo.ExpiresAt)
+		fmt.Println()
+		if result.IsCollection {
+			fmt.Printf("Collection: %s\n", result.Collection.URL)
+			fmt.Printf("Expires:    %s\n", result.Collection.ExpiresAt)
+		} else {
+			fmt.Printf("URL:     %s\n", result.FileInfo.URL)
+			fmt.Printf("Raw:     %s\n", result.FileInfo.RawURL)
+			fmt.Printf("Size:    %s\n", result.FileInfo.HumanSize)
+			fmt.Printf("Expires: %s\n", result.FileInfo.ExpiresAt)
+		}
 	}
 
 	return nil

@@ -1,5 +1,7 @@
 # storageto
 
+**Upload a file, get a link. No buckets.**
+
 Command-line tool for [storage.to](https://storage.to) - simple, fast file sharing.
 
 ## Installation
@@ -77,8 +79,31 @@ Press Ctrl+C to cancel - partial uploads are cleaned up automatically.
 Flags:
   -c, --collection   Force collection even for single file
   -v, --verbose      Show detailed progress
+      --json         Output result as JSON (for scripting)
+      --no-token     Run without persistent identity token
       --api string   API endpoint (default "https://storage.to")
   -h, --help         Show help
+```
+
+### JSON output
+
+Use `--json` for machine-readable output:
+
+```bash
+storageto upload photo.jpg --json
+```
+
+```json
+{
+  "is_collection": false,
+  "file_info": {
+    "url": "https://storage.to/FQxyz1234",
+    "raw_url": "https://storage.to/r/FQxyz1234",
+    "size": 2097152,
+    "human_size": "2.0 MB",
+    "expires_at": "2026-01-29T12:00:00Z"
+  }
+}
 ```
 
 ## Downloading Files
@@ -98,11 +123,17 @@ curl https://storage.to/c/FQabc5678.json
 
 ## Configuration
 
-The CLI stores a persistent identity token in `~/.config/storageto/token`. This:
+The CLI stores a persistent identity token for upload tracking:
 
-- Tracks your uploads consistently across sessions
-- Allows associating uploads with your account if you sign up later
-- Is automatically generated on first use
+- **Location**: `~/.config/storageto/token` (Linux), `~/Library/Application Support/storageto/token` (macOS), `%AppData%\storageto\token` (Windows)
+- **What it is**: A random anonymous identifier (not an API key or auth token)
+- **What it does**: Links uploads from this machine so you can see "your recent uploads" without signup
+- **Privacy**: Delete the token file to reset your identity, or use `--no-token` for fully anonymous uploads
+
+```bash
+# Run without any identity tracking
+storageto upload photo.jpg --no-token
+```
 
 ## Limits
 
