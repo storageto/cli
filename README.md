@@ -7,7 +7,12 @@ Command-line tool for [storage.to](https://storage.to) - simple, fast file shari
 ### Using Go
 
 ```bash
-go install github.com/ryanbadger/storage.to-cli@latest
+go install github.com/ryanbadger/storage.to-cli/cmd/storageto@latest
+```
+
+Make sure `~/go/bin` is in your PATH:
+```bash
+export PATH="$PATH:$HOME/go/bin"
 ```
 
 ### From Source
@@ -15,7 +20,7 @@ go install github.com/ryanbadger/storage.to-cli@latest
 ```bash
 git clone https://github.com/ryanbadger/storage.to-cli.git
 cd storage.to-cli
-make build
+make install
 ```
 
 ### Pre-built Binaries
@@ -131,17 +136,16 @@ make test
 ### Project structure
 
 ```
-├── cmd/                 # CLI commands (cobra)
-│   ├── root.go         # Root command and flags
-│   ├── upload.go       # Upload command
-│   └── version.go      # Version command
+├── cmd/
+│   └── storageto/
+│       └── main.go         # Entry point
 ├── internal/
-│   ├── api/            # API client
-│   ├── config/         # Config and token management
-│   ├── upload/         # Upload logic (single + multipart)
-│   └── version/        # Version info (set at build time)
-├── main.go
-├── Makefile            # Build with version injection
+│   ├── api/                # API client
+│   ├── cli/                # CLI commands (cobra)
+│   ├── config/             # Config and token management
+│   ├── upload/             # Upload logic (single + multipart)
+│   └── version/            # Version info (set at build time)
+├── Makefile                # Build with version injection
 └── README.md
 ```
 

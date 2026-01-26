@@ -10,10 +10,10 @@ LDFLAGS := -ldflags "-s -w \
 	-X github.com/ryanbadger/storage.to-cli/internal/version.BuildDate=$(DATE)"
 
 build:
-	go build $(LDFLAGS) -o storageto .
+	go build $(LDFLAGS) -o storageto ./cmd/storageto
 
 install:
-	go install $(LDFLAGS) .
+	go install $(LDFLAGS) ./cmd/storageto
 
 test:
 	go test -v ./...
@@ -25,9 +25,9 @@ clean:
 # Cross-compile for releases
 release: clean
 	mkdir -p dist
-	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-darwin-amd64 .
-	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o dist/storageto-darwin-arm64 .
-	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-linux-amd64 .
-	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/storageto-linux-arm64 .
-	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-windows-amd64.exe .
+	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-darwin-amd64 ./cmd/storageto
+	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o dist/storageto-darwin-arm64 ./cmd/storageto
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-linux-amd64 ./cmd/storageto
+	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/storageto-linux-arm64 ./cmd/storageto
+	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/storageto-windows-amd64.exe ./cmd/storageto
 	cd dist && sha256sum * > checksums.txt
