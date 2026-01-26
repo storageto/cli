@@ -1,6 +1,6 @@
-# Binary
-storageto
-storageto.exe
+# Binary (at root level only)
+/storageto
+/storageto.exe
 
 # Build artifacts
 dist/
