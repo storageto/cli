@@ -24,3 +24,6 @@ coverage.out
 
 # Local config (don't commit tokens)
 .env
+
+# Claude Code context (local only)
+CLAUDE.md
