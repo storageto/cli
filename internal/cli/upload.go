@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/ryanbadger/storage.to-cli/internal/api"
-	"github.com/ryanbadger/storage.to-cli/internal/config"
-	"github.com/ryanbadger/storage.to-cli/internal/upload"
+	"github.com/storageto/cli/internal/api"
+	"github.com/storageto/cli/internal/config"
+	"github.com/storageto/cli/internal/upload"
 	"github.com/spf13/cobra"
 )
 

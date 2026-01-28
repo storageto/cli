@@ -6,28 +6,31 @@ Command-line tool for [storage.to](https://storage.to) - simple, fast file shari
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install storageto/tap/storageto
+```
+
 ### Using Go
 
 ```bash
-go install github.com/ryanbadger/storage.to-cli/cmd/storageto@latest
+go install github.com/storageto/cli/cmd/storageto@latest
 ```
 
-Make sure `~/go/bin` is in your PATH:
-```bash
-export PATH="$PATH:$HOME/go/bin"
-```
+Make sure `~/go/bin` is in your PATH.
+
+### Pre-built Binaries
+
+Download from [Releases](https://github.com/storageto/cli/releases).
 
 ### From Source
 
 ```bash
-git clone https://github.com/ryanbadger/storage.to-cli.git
-cd storage.to-cli
+git clone https://github.com/storageto/cli.git
+cd cli
 make install
 ```
-
-### Pre-built Binaries
-
-Download from [Releases](https://github.com/ryanbadger/storage.to-cli/releases).
 
 ## Usage
 
@@ -152,7 +155,7 @@ storageto upload photo.jpg --no-token
 ### Building from source
 
 ```bash
-git clone https://github.com/ryanbadger/storage.to-cli.git
+git clone https://github.com/storageto/cli.git
 cd storage.to-cli
 make build      # Build binary
 make test       # Run tests

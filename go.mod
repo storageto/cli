@@ -1,4 +1,4 @@
-module github.com/ryanbadger/storage.to-cli
+module github.com/storageto/cli
 
 go 1.22
 

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ryanbadger/storage.to-cli/internal/version"
+	"github.com/storageto/cli/internal/version"
 )
 
 // Client handles API communication with storage.to
