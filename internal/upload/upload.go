@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ryanbadger/storage.to-cli/internal/api"
-	"github.com/ryanbadger/storage.to-cli/internal/version"
+	"github.com/storageto/cli/internal/api"
+	"github.com/storageto/cli/internal/version"
 )
 
 const (

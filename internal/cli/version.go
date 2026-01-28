@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/ryanbadger/storage.to-cli/internal/version"
+	"github.com/storageto/cli/internal/version"
 	"github.com/spf13/cobra"
 )
 

@@ -5,9 +5,9 @@ COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS := -ldflags "-s -w \
-	-X github.com/ryanbadger/storage.to-cli/internal/version.Version=$(VERSION) \
-	-X github.com/ryanbadger/storage.to-cli/internal/version.GitCommit=$(COMMIT) \
-	-X github.com/ryanbadger/storage.to-cli/internal/version.BuildDate=$(DATE)"
+	-X github.com/storageto/cli/internal/version.Version=$(VERSION) \
+	-X github.com/storageto/cli/internal/version.GitCommit=$(COMMIT) \
+	-X github.com/storageto/cli/internal/version.BuildDate=$(DATE)"
 
 build:
 	go build $(LDFLAGS) -o storageto ./cmd/storageto
