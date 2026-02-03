@@ -69,3 +69,91 @@ jobs:
           draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew Formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
+            exit 0
+          fi
+
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "Updating Homebrew formula to version $VERSION"
+
+          # Get checksums from the dist folder
+          SHA_DARWIN_ARM64=$(grep darwin-arm64 dist/checksums.txt | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(grep darwin-amd64 dist/checksums.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep linux-arm64 dist/checksums.txt | awk '{print $1}')
+          SHA_LINUX_AMD64=$(grep linux-amd64 dist/checksums.txt | awk '{print $1}')
+
+          echo "SHA256 checksums:"
+          echo "  darwin-arm64: $SHA_DARWIN_ARM64"
+          echo "  darwin-amd64: $SHA_DARWIN_AMD64"
+          echo "  linux-arm64: $SHA_LINUX_ARM64"
+          echo "  linux-amd64: $SHA_LINUX_AMD64"
+
+          # Clone homebrew-tap
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/storageto/homebrew-tap.git
+          cd homebrew-tap
+
+          # Update the formula
+          cat > Formula/storageto.rb << 'FORMULA'
+          # Homebrew formula for storageto
+          # To install: brew install storageto/tap/storageto
+
+          class Storageto < Formula
+            desc "CLI tool for storage.to - simple file sharing"
+            homepage "https://github.com/storageto/cli"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/storageto/cli/releases/download/v#{version}/storageto-darwin-arm64.tar.gz"
+                sha256 "SHA_DARWIN_ARM64_PLACEHOLDER"
+              end
+              on_intel do
+                url "https://github.com/storageto/cli/releases/download/v#{version}/storageto-darwin-amd64.tar.gz"
+                sha256 "SHA_DARWIN_AMD64_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/storageto/cli/releases/download/v#{version}/storageto-linux-arm64.tar.gz"
+                sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+              end
+              on_intel do
+                url "https://github.com/storageto/cli/releases/download/v#{version}/storageto-linux-amd64.tar.gz"
+                sha256 "SHA_LINUX_AMD64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "storageto"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/storageto version")
+            end
+          end
+          FORMULA
+
+          # Replace placeholders
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" Formula/storageto.rb
+          sed -i "s/SHA_DARWIN_ARM64_PLACEHOLDER/$SHA_DARWIN_ARM64/g" Formula/storageto.rb
+          sed -i "s/SHA_DARWIN_AMD64_PLACEHOLDER/$SHA_DARWIN_AMD64/g" Formula/storageto.rb
+          sed -i "s/SHA_LINUX_ARM64_PLACEHOLDER/$SHA_LINUX_ARM64/g" Formula/storageto.rb
+          sed -i "s/SHA_LINUX_AMD64_PLACEHOLDER/$SHA_LINUX_AMD64/g" Formula/storageto.rb
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' Formula/storageto.rb
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/storageto.rb
+          git commit -m "Update storageto to v$VERSION"
+          git push
