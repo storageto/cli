@@ -135,6 +135,68 @@ type MarkCollectionReadyResponse struct {
 	Collection *CollectionInfo `json:"collection,omitempty"`
 }
 
+// Batch upload types
+
+// BatchFileRequest represents a single file in a batch init request
+type BatchFileRequest struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+}
+
+// InitBatchRequest for /api/upload/init-batch
+type InitBatchRequest struct {
+	Files []BatchFileRequest `json:"files"`
+}
+
+// InitBatchResult represents the init result for a single file
+type InitBatchResult struct {
+	Success     bool              `json:"success,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Type        string            `json:"type,omitempty"`
+	UploadURL   string            `json:"upload_url,omitempty"`
+	R2Key       string            `json:"r2_key,omitempty"`
+	UploadID    string            `json:"upload_id,omitempty"`
+	PartSize    int64             `json:"part_size,omitempty"`
+	TotalParts  int               `json:"total_parts,omitempty"`
+	InitialURLs map[string]string `json:"initial_urls,omitempty"`
+}
+
+// InitBatchResponse from /api/upload/init-batch
+type InitBatchResponse struct {
+	Success bool                       `json:"success"`
+	Error   string                     `json:"error,omitempty"`
+	Results map[string]InitBatchResult `json:"results,omitempty"`
+}
+
+// BatchConfirmFile represents a single file in a batch confirm request
+type BatchConfirmFile struct {
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type"`
+	R2Key       string `json:"r2_key"`
+}
+
+// ConfirmBatchRequest for /api/upload/confirm-batch
+type ConfirmBatchRequest struct {
+	CollectionID string             `json:"collection_id,omitempty"`
+	Files        []BatchConfirmFile `json:"files"`
+}
+
+// ConfirmBatchResult represents the confirm result for a single file
+type ConfirmBatchResult struct {
+	Success bool      `json:"success"`
+	Error   string    `json:"error,omitempty"`
+	File    *FileInfo `json:"file,omitempty"`
+}
+
+// ConfirmBatchResponse from /api/upload/confirm-batch
+type ConfirmBatchResponse struct {
+	Success bool                          `json:"success"`
+	Error   string                        `json:"error,omitempty"`
+	Results map[string]ConfirmBatchResult `json:"results,omitempty"`
+}
+
 // InitUpload initiates an upload
 func (c *Client) InitUpload(ctx context.Context, req *InitUploadRequest) (*InitUploadResponse, error) {
 	var resp InitUploadResponse
@@ -215,6 +277,30 @@ func (c *Client) AbortUpload(ctx context.Context, uploadID string) error {
 func (c *Client) MarkCollectionReady(ctx context.Context, collectionID string) (*MarkCollectionReadyResponse, error) {
 	var resp MarkCollectionReadyResponse
 	if err := c.post(ctx, fmt.Sprintf("/api/collection/%s/ready", collectionID), struct{}{}, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+	return &resp, nil
+}
+
+// InitUploadBatch initiates uploads for multiple files in a single API call
+func (c *Client) InitUploadBatch(ctx context.Context, req *InitBatchRequest) (*InitBatchResponse, error) {
+	var resp InitBatchResponse
+	if err := c.post(ctx, "/api/upload/init-batch", req, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+	return &resp, nil
+}
+
+// ConfirmUploadBatch confirms multiple uploads in a single API call
+func (c *Client) ConfirmUploadBatch(ctx context.Context, req *ConfirmBatchRequest) (*ConfirmBatchResponse, error) {
+	var resp ConfirmBatchResponse
+	if err := c.post(ctx, "/api/upload/confirm-batch", req, &resp); err != nil {
 		return nil, err
 	}
 	if !resp.Success {
