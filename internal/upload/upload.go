@@ -21,6 +21,8 @@ const (
 	maxRetries       = 3
 	retryDelay       = 2 * time.Second
 	concurrentParts  = 4
+	concurrentFiles  = 6   // Concurrent file uploads (matches web/desktop)
+	batchSize        = 250 // Max files per batch API call
 	partURLBatchSize = 50
 	uploadTimeout    = 30 * time.Minute
 )
@@ -109,6 +111,19 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 	return confirmResp.File, nil
 }
 
+// fileMetadata holds information about a file to upload
+type fileMetadata struct {
+	path        string
+	filename    string
+	contentType string
+	size        int64
+	index       int
+	// Set after init
+	uploadURL string
+	r2Key     string
+	uploadErr error
+}
+
 // UploadFiles uploads multiple files, optionally as a collection
 func (u *Uploader) UploadFiles(ctx context.Context, paths []string, asCollection bool) (*Result, error) {
 	if len(paths) == 0 {
@@ -124,39 +139,190 @@ func (u *Uploader) UploadFiles(ctx context.Context, paths []string, asCollection
 		return &Result{FileInfo: fileInfo}, nil
 	}
 
-	// Multiple files or explicit collection
+	// Multiple files - use batch upload with concurrency
+	return u.uploadFilesBatch(ctx, paths)
+}
+
+// uploadFilesBatch uploads multiple files using batch API endpoints and concurrent R2 uploads
+func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Result, error) {
+	// Step 1: Collect file metadata
+	files := make([]*fileMetadata, 0, len(paths))
+	for i, path := range paths {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open %s: %w", path, err)
+		}
+
+		stat, err := file.Stat()
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("cannot stat %s: %w", path, err)
+		}
+
+		contentType := detectContentType(path, file)
+		file.Close()
+
+		files = append(files, &fileMetadata{
+			path:        path,
+			filename:    filepath.Base(path),
+			contentType: contentType,
+			size:        stat.Size(),
+			index:       i,
+		})
+	}
+
+	// Step 2: Create collection
 	collResp, err := u.client.CreateCollection(ctx, &api.CreateCollectionRequest{
-		ExpectedFileCount: len(paths),
+		ExpectedFileCount: len(files),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
+	collectionID := collResp.Collection.ID
+	u.log("Created collection %s for %d files\n", collectionID, len(files))
 
-	u.log("Created collection %s\n", collResp.Collection.ID)
+	// Step 3: Batch init - get presigned URLs for all files
+	fmt.Printf("Initializing %d files...\n", len(files))
+	for batchStart := 0; batchStart < len(files); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(files) {
+			batchEnd = len(files)
+		}
+		batch := files[batchStart:batchEnd]
 
-	// Upload each file
-	for i, path := range paths {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("upload cancelled")
+		// Build batch request
+		batchReq := &api.InitBatchRequest{
+			Files: make([]api.BatchFileRequest, len(batch)),
+		}
+		for i, f := range batch {
+			batchReq.Files[i] = api.BatchFileRequest{
+				Filename:    f.filename,
+				ContentType: f.contentType,
+				Size:        f.size,
+			}
 		}
 
-		fmt.Printf("[%d/%d] ", i+1, len(paths))
-		_, err := u.UploadFile(ctx, path, collResp.Collection.ID)
+		// Call init-batch
+		initResp, err := u.client.InitUploadBatch(ctx, batchReq)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload %s: %w", filepath.Base(path), err)
+			return nil, fmt.Errorf("failed to init batch: %w", err)
+		}
+
+		// Store results
+		for i, f := range batch {
+			idxStr := strconv.Itoa(i)
+			if result, ok := initResp.Results[idxStr]; ok {
+				if result.Error != "" {
+					f.uploadErr = fmt.Errorf("%s", result.Error)
+				} else {
+					f.uploadURL = result.UploadURL
+					f.r2Key = result.R2Key
+				}
+			}
 		}
 	}
 
-	// Mark collection ready
-	readyResp, err := u.client.MarkCollectionReady(ctx, collResp.Collection.ID)
+	// Step 4: Upload to R2 concurrently (6 at a time)
+	fmt.Printf("Uploading %d files (6 concurrent)...\n", len(files))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrentFiles)
+	var uploadedCount int64
+	var errorCount int64
+
+	for _, f := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		if f.uploadErr != nil || f.uploadURL == "" {
+			atomic.AddInt64(&errorCount, 1)
+			continue
+		}
+
+		wg.Add(1)
+		sem <- struct{}{} // Acquire
+
+		go func(fm *fileMetadata) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release
+
+			err := u.uploadFileToR2(ctx, fm)
+			if err != nil {
+				fm.uploadErr = err
+				atomic.AddInt64(&errorCount, 1)
+			} else {
+				n := atomic.AddInt64(&uploadedCount, 1)
+				fmt.Printf("\r  Uploaded %d/%d files", n, len(files))
+			}
+		}(f)
+	}
+	wg.Wait()
+	fmt.Println() // newline after progress
+
+	// Step 5: Batch confirm - create File records
+	fmt.Printf("Confirming %d files...\n", uploadedCount)
+
+	// Collect successfully uploaded files
+	var toConfirm []*fileMetadata
+	for _, f := range files {
+		if f.uploadErr == nil && f.r2Key != "" {
+			toConfirm = append(toConfirm, f)
+		}
+	}
+
+	for batchStart := 0; batchStart < len(toConfirm); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(toConfirm) {
+			batchEnd = len(toConfirm)
+		}
+		batch := toConfirm[batchStart:batchEnd]
+
+		// Build confirm request
+		confirmReq := &api.ConfirmBatchRequest{
+			CollectionID: collectionID,
+			Files:        make([]api.BatchConfirmFile, len(batch)),
+		}
+		for i, f := range batch {
+			confirmReq.Files[i] = api.BatchConfirmFile{
+				Filename:    f.filename,
+				Size:        f.size,
+				ContentType: f.contentType,
+				R2Key:       f.r2Key,
+			}
+		}
+
+		// Call confirm-batch
+		_, err := u.client.ConfirmUploadBatch(ctx, confirmReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to confirm batch: %w", err)
+		}
+	}
+
+	// Step 6: Mark collection ready
+	readyResp, err := u.client.MarkCollectionReady(ctx, collectionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to finalize collection: %w", err)
+	}
+
+	if errorCount > 0 {
+		fmt.Printf("Warning: %d files failed to upload\n", errorCount)
 	}
 
 	return &Result{
 		Collection:   readyResp.Collection,
 		IsCollection: true,
 	}, nil
+}
+
+// uploadFileToR2 uploads a single file to R2 using a presigned URL
+func (u *Uploader) uploadFileToR2(ctx context.Context, fm *fileMetadata) error {
+	file, err := os.Open(fm.path)
+	if err != nil {
+		return fmt.Errorf("cannot open file: %w", err)
+	}
+	defer file.Close()
+
+	return u.uploadSingle(ctx, file, fm.uploadURL, fm.contentType, fm.size)
 }
 
 // uploadSingle uploads a file in a single PUT request
