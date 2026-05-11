@@ -3,7 +3,6 @@ package upload
 import (
 	"context"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"net/http"
 	"os"
@@ -88,25 +87,23 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 	}
 
 	// Upload based on type
-	var fileCrc uint32
 	if initResp.Type == "single" {
-		fileCrc, err = u.uploadSingle(ctx, file, initResp.UploadURL, contentType, size)
+		err = u.uploadSingle(ctx, file, initResp.UploadURL, contentType, size)
 	} else {
-		fileCrc, err = u.uploadMultipart(ctx, file, initResp, size)
+		err = u.uploadMultipart(ctx, file, initResp, size)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// Confirm upload
-	crc32Val := uint64(fileCrc)
+	// Confirm upload. CRC-32 is computed server-side from R2 by the
+	// ComputeFileSha256 job — no need to re-scan the local file here.
 	confirmResp, err := u.client.ConfirmUpload(ctx, &api.ConfirmUploadRequest{
 		Filename:     filename,
 		Size:         size,
 		ContentType:  contentType,
 		R2Key:        initResp.R2Key,
 		CollectionID: collectionID,
-		CRC32:        &crc32Val,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to confirm upload: %w", err)
@@ -126,8 +123,6 @@ type fileMetadata struct {
 	uploadURL string
 	r2Key     string
 	uploadErr error
-	// Set after upload
-	crc32 uint32
 }
 
 // UploadFiles uploads multiple files, optionally as a collection
@@ -283,19 +278,18 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		}
 		batch := toConfirm[batchStart:batchEnd]
 
-		// Build confirm request
+		// Build confirm request. CRC-32 is computed server-side from R2,
+		// so the CLI no longer needs to scan files locally.
 		confirmReq := &api.ConfirmBatchRequest{
 			CollectionID: collectionID,
 			Files:        make([]api.BatchConfirmFile, len(batch)),
 		}
 		for i, f := range batch {
-			crc := uint64(f.crc32)
 			confirmReq.Files[i] = api.BatchConfirmFile{
 				Filename:    f.filename,
 				Size:        f.size,
 				ContentType: f.contentType,
 				R2Key:       f.r2Key,
-				CRC32:       &crc,
 			}
 		}
 
@@ -330,18 +324,12 @@ func (u *Uploader) uploadFileToR2(ctx context.Context, fm *fileMetadata) error {
 	}
 	defer file.Close()
 
-	fileCrc, err := u.uploadSingle(ctx, file, fm.uploadURL, fm.contentType, fm.size)
-	if err != nil {
-		return err
-	}
-	fm.crc32 = fileCrc
-	return nil
+	return u.uploadSingle(ctx, file, fm.uploadURL, fm.contentType, fm.size)
 }
 
-// uploadSingle uploads a file in a single PUT request and returns the CRC-32
-func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL string, contentType string, size int64) (uint32, error) {
-	var fileCrc uint32
-	err := u.uploadWithRetry(ctx, func() error {
+// uploadSingle uploads a file in a single PUT request
+func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL string, contentType string, size int64) error {
+	return u.uploadWithRetry(ctx, func() error {
 		file.Seek(0, 0)
 
 		// Create context with timeout for the upload
@@ -351,7 +339,6 @@ func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL st
 		pr := &progressReader{
 			reader: file,
 			total:  size,
-			hasher: crc32.IEEETable,
 			onProgress: func(uploaded, total int64) {
 				u.printProgress(uploaded, total)
 			},
@@ -384,15 +371,13 @@ func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL st
 			return fmt.Errorf("upload failed (HTTP %d): %s", resp.StatusCode, string(body))
 		}
 
-		fileCrc = pr.crc
 		fmt.Println() // newline after progress
 		return nil
 	})
-	return fileCrc, err
 }
 
-// uploadMultipart uploads a file in multiple parts and returns the CRC-32
-func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp *api.InitUploadResponse, size int64) (uint32, error) {
+// uploadMultipart uploads a file in multiple parts
+func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp *api.InitUploadResponse, size int64) error {
 	u.log("Multipart upload: %d parts, %s each\n", initResp.TotalParts, humanSize(initResp.PartSize))
 
 	// Abort cleanup on cancellation
@@ -437,7 +422,7 @@ func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp 
 				PartNumbers: generatePartNumbers(partNum, min(partNum+partURLBatchSize-1, initResp.TotalParts)),
 			})
 			if err != nil {
-				return 0, fmt.Errorf("failed to get upload URLs: %w", err)
+				return fmt.Errorf("failed to get upload URLs: %w", err)
 			}
 			// Merge into initResp for future use
 			for k, v := range moreURLs.URLs {
@@ -485,31 +470,23 @@ func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp 
 	fmt.Println() // newline after progress
 
 	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("upload cancelled")
+		return fmt.Errorf("upload cancelled")
 	}
 
 	if err := uploadErr.Load(); err != nil {
-		return 0, err.(error)
+		return err.(error)
 	}
 
-	// Complete multipart upload
+	// Complete multipart upload. CRC-32 is computed server-side from R2.
 	_, err := u.client.CompleteMultipart(ctx, &api.CompleteMultipartRequest{
 		UploadID: initResp.UploadID,
 		Parts:    parts,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("failed to complete upload: %w", err)
+		return fmt.Errorf("failed to complete upload: %w", err)
 	}
 
-	// Compute CRC-32 by reading the file sequentially from disk
-	// This is fast (local disk) compared to the upload itself
-	file.Seek(0, 0)
-	h := crc32.NewIEEE()
-	if _, err := io.Copy(h, file); err != nil {
-		return 0, fmt.Errorf("failed to compute CRC-32: %w", err)
-	}
-
-	return h.Sum32(), nil
+	return nil
 }
 
 // uploadPart uploads a single part and returns its ETag
@@ -599,23 +576,18 @@ func (u *Uploader) printProgress(uploaded, total int64) {
 	fmt.Printf("\r  %s / %s (%.1f%%)  ", humanSize(uploaded), humanSize(total), pct)
 }
 
-// progressReader wraps a reader to track progress and optionally compute CRC-32
+// progressReader wraps a reader to track progress
 type progressReader struct {
 	reader     io.Reader
 	total      int64
 	uploaded   int64
 	onProgress func(uploaded, total int64)
-	hasher     *crc32.Table
-	crc        uint32
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.reader.Read(p)
 	if n > 0 {
 		pr.uploaded += int64(n)
-		if pr.hasher != nil {
-			pr.crc = crc32.Update(pr.crc, pr.hasher, p[:n])
-		}
 		if pr.onProgress != nil {
 			pr.onProgress(pr.uploaded, pr.total)
 		}
