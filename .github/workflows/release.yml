@@ -72,10 +72,10 @@ jobs:
 
       - name: Update Homebrew Formula
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
+          if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
+            echo "HOMEBREW_TAP_DEPLOY_KEY not set, skipping Homebrew update"
             exit 0
           fi
 
@@ -94,8 +94,15 @@ jobs:
           echo "  linux-arm64: $SHA_LINUX_ARM64"
           echo "  linux-amd64: $SHA_LINUX_AMD64"
 
-          # Clone homebrew-tap
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/storageto/homebrew-tap.git
+          # Set up SSH with the deploy key (scoped to homebrew-tap only).
+          mkdir -p ~/.ssh
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/homebrew_tap_key
+          chmod 600 ~/.ssh/homebrew_tap_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/homebrew_tap_key -o IdentitiesOnly=yes"
+
+          # Clone homebrew-tap via SSH
+          git clone git@github.com:storageto/homebrew-tap.git
           cd homebrew-tap
 
           # Update the formula
