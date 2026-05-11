@@ -84,12 +84,11 @@ type CompleteMultipartResponse struct {
 
 // ConfirmUploadRequest for /api/upload/confirm
 type ConfirmUploadRequest struct {
-	Filename     string  `json:"filename"`
-	Size         int64   `json:"size"`
-	ContentType  string  `json:"content_type"`
-	R2Key        string  `json:"r2_key"`
-	CollectionID string  `json:"collection_id,omitempty"`
-	CRC32        *uint64 `json:"crc32,omitempty"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"content_type"`
+	R2Key        string `json:"r2_key"`
+	CollectionID string `json:"collection_id,omitempty"`
 }
 
 // ConfirmUploadResponse from /api/upload/confirm
@@ -172,11 +171,10 @@ type InitBatchResponse struct {
 
 // BatchConfirmFile represents a single file in a batch confirm request
 type BatchConfirmFile struct {
-	Filename    string  `json:"filename"`
-	Size        int64   `json:"size"`
-	ContentType string  `json:"content_type"`
-	R2Key       string  `json:"r2_key"`
-	CRC32       *uint64 `json:"crc32,omitempty"`
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type"`
+	R2Key       string `json:"r2_key"`
 }
 
 // ConfirmBatchRequest for /api/upload/confirm-batch
