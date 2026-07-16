@@ -121,7 +121,6 @@ func runUpload(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Expires:    %s\n", result.Collection.ExpiresAt)
 		} else {
 			fmt.Printf("URL:     %s\n", result.FileInfo.URL)
-			fmt.Printf("Raw:     %s\n", result.FileInfo.RawURL)
 			fmt.Printf("Size:    %s\n", result.FileInfo.HumanSize)
 			fmt.Printf("Expires: %s\n", result.FileInfo.ExpiresAt)
 		}
