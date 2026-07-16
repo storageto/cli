@@ -94,7 +94,7 @@ func TestDetectContentType(t *testing.T) {
 		}
 
 		got := detectContentType(path, file)
-		file.Close()
+		_ = file.Close()
 
 		if got != tt.wantMime {
 			t.Errorf("detectContentType(%q) = %q, want %q", tt.filename, got, tt.wantMime)

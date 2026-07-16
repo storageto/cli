@@ -36,7 +36,12 @@ jobs:
         with:
           go-version: '1.22'
 
+      # Reproduce locally with:
+      #   go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+      # Keep this version in step with that command. The old v1.59.1 pin could not be
+      # run locally at all on a current Go toolchain (its vendored x/tools fails to
+      # compile on Go 1.25), so nobody could reproduce this job before pushing.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.59.1
+          version: v2.12.2
