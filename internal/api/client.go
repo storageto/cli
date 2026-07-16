@@ -102,7 +102,6 @@ type ConfirmUploadResponse struct {
 type FileInfo struct {
 	ID        string `json:"id"`
 	URL       string `json:"url"`
-	RawURL    string `json:"raw_url"`
 	Filename  string `json:"filename"`
 	Size      int64  `json:"size"`
 	HumanSize string `json:"human_size"`

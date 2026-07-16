@@ -43,13 +43,11 @@ storageto upload photo.jpg
 Output:
 ```
 URL:     https://storage.to/FQxyz1234
-Raw:     https://storage.to/r/FQxyz1234
 Size:    2.1 MB
 Expires: 2026-01-29T12:00:00Z
 ```
 
 - **URL** - Human-friendly download page
-- **Raw** - Direct download link (for `curl`, `wget`, scripts)
 
 ### Upload multiple files
 
@@ -101,7 +99,6 @@ storageto upload photo.jpg --json
   "is_collection": false,
   "file_info": {
     "url": "https://storage.to/FQxyz1234",
-    "raw_url": "https://storage.to/r/FQxyz1234",
     "size": 2097152,
     "human_size": "2.0 MB",
     "expires_at": "2026-01-29T12:00:00Z"
@@ -111,15 +108,16 @@ storageto upload photo.jpg --json
 
 ## Downloading Files
 
-The CLI creates shareable URLs. Anyone can download:
+The CLI creates shareable URLs. Open the link to reach the download page:
+
+```
+https://storage.to/FQxyz1234
+```
+
+There is no direct hotlink endpoint - every share link opens the storage.to
+download page rather than serving the file itself.
 
 ```bash
-# Direct download (follows redirect to file)
-curl -LO https://storage.to/r/FQxyz1234
-
-# Check file info first
-curl -I https://storage.to/r/FQxyz1234
-
 # Download collection as JSON manifest
 curl https://storage.to/c/FQabc5678.json
 ```
