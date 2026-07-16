@@ -1,0 +1,8 @@
+version: "2"
+
+issues:
+  # Report every finding. The defaults (max-same-issues: 3, max-issues-per-linter: 50)
+  # silently truncate repeats, which is how "13 errcheck findings" got recorded in
+  # issue #4 when there were really 16 - three were hidden behind the same message.
+  max-same-issues: 0
+  max-issues-per-linter: 0

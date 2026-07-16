@@ -60,7 +60,7 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	stat, err := file.Stat()
 	if err != nil {
@@ -72,7 +72,9 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 	size := stat.Size()
 
 	// Reset file position after content type detection
-	file.Seek(0, 0)
+	if _, err := file.Seek(0, 0); err != nil {
+		return nil, fmt.Errorf("cannot rewind %s: %w", filename, err)
+	}
 
 	u.log("Uploading %s (%s)\n", filename, humanSize(size))
 
@@ -156,12 +158,12 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 
 		stat, err := file.Stat()
 		if err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, fmt.Errorf("cannot stat %s: %w", path, err)
 		}
 
 		contentType := detectContentType(path, file)
-		file.Close()
+		_ = file.Close()
 
 		files = append(files, &fileMetadata{
 			path:        path,
@@ -322,7 +324,7 @@ func (u *Uploader) uploadFileToR2(ctx context.Context, fm *fileMetadata) error {
 	if err != nil {
 		return fmt.Errorf("cannot open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	return u.uploadSingle(ctx, file, fm.uploadURL, fm.contentType, fm.size)
 }
@@ -330,7 +332,11 @@ func (u *Uploader) uploadFileToR2(ctx context.Context, fm *fileMetadata) error {
 // uploadSingle uploads a file in a single PUT request
 func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL string, contentType string, size int64) error {
 	return u.uploadWithRetry(ctx, func() error {
-		file.Seek(0, 0)
+		// Rewind before every attempt: a retry that cannot rewind would upload
+		// from wherever the previous attempt stopped, silently truncating.
+		if _, err := file.Seek(0, 0); err != nil {
+			return fmt.Errorf("cannot rewind file for upload: %w", err)
+		}
 
 		// Create context with timeout for the upload
 		uploadCtx, cancel := context.WithTimeout(ctx, uploadTimeout)
@@ -364,7 +370,7 @@ func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL st
 			}
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(resp.Body)
@@ -386,7 +392,8 @@ func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp 
 			// Best effort abort - use background context since main ctx is cancelled
 			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			u.client.AbortUpload(abortCtx, initResp.UploadID)
+			// Best effort: the upload is already being cancelled.
+			_ = u.client.AbortUpload(abortCtx, initResp.UploadID)
 			u.log("Cleaned up partial upload\n")
 		}
 	}()
@@ -521,7 +528,7 @@ func (u *Uploader) uploadPart(ctx context.Context, file *os.File, url string, of
 			}
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(resp.Body)
@@ -655,7 +662,10 @@ func detectContentType(path string, file *os.File) string {
 	// Detect from content
 	buf := make([]byte, 512)
 	n, _ := file.Read(buf)
-	file.Seek(0, 0)
+	// Best-effort rewind: this helper has no error return, and both callers
+	// cover it anyway - UploadFile re-seeks and checks, uploadFilesBatch closes
+	// the file straight after.
+	_, _ = file.Seek(0, 0)
 
 	return http.DetectContentType(buf[:n])
 }

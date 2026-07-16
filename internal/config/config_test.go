@@ -12,15 +12,12 @@ func TestGetVisitorToken(t *testing.T) {
 	// Use temp directory for test
 	tmpDir := t.TempDir()
 
-	// Override HOME and XDG_CONFIG_HOME for test isolation
-	originalHome := os.Getenv("HOME")
-	originalXDG := os.Getenv("XDG_CONFIG_HOME")
-	os.Setenv("HOME", tmpDir)
-	os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
-	defer func() {
-		os.Setenv("HOME", originalHome)
-		os.Setenv("XDG_CONFIG_HOME", originalXDG)
-	}()
+	// Override HOME and XDG_CONFIG_HOME for test isolation. t.Setenv restores
+	// the previous values automatically and fails the test if the set errors.
+	// (Note: on darwin only HOME is consulted - os.UserConfigDir ignores
+	// XDG_CONFIG_HOME outside the Unix branch.)
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
 
 	// First call should generate token
 	token1, err := GetVisitorToken()
