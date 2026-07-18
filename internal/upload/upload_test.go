@@ -1,8 +1,14 @@
 package upload
 
 import (
+	"context"
+	"crypto/rand"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -101,3 +107,76 @@ func TestDetectContentType(t *testing.T) {
 		}
 	}
 }
+
+// TestUploadPartProgressReportsExactBytes is a regression test for the
+// displayed-size bug (issue #1): uploading a .7z showed "121.6 GB / 248.6 MB
+// (50083.1%)" for a file far smaller than that. The root cause was that
+// progressReader reports the CUMULATIVE bytes read so far on every Read()
+// call, but uploadMultipart's shared counter treated each report as an
+// INCREMENTAL delta and added it directly - so every chunk re-added the
+// whole running total, wildly overcounting. This drives uploadPart against a
+// real HTTP server with a body large enough to force multiple Read() calls
+// (the net/http client copies request bodies in ~32KB chunks) and asserts
+// the sum of everything reported through onProgress equals the part size
+// exactly, not some multiple of it.
+func TestUploadPartProgressReportsExactBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if n != partSize {
+			http.Error(w, "unexpected body size", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("ETag", `"etag-1"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "part.bin")
+	data := make([]byte, partSize)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatalf("failed to generate random data: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("failed to open test file: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	u := NewUploader(nil, false)
+
+	var mu sync.Mutex
+	var total int64
+	var maxSeen int64
+	etag, err := u.uploadPart(context.Background(), file, srv.URL, 0, partSize, func(n int64) {
+		mu.Lock()
+		total += n
+		if total > maxSeen {
+			maxSeen = total
+		}
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("uploadPart failed: %v", err)
+	}
+	if etag != "etag-1" {
+		t.Errorf("etag = %q, want %q", etag, "etag-1")
+	}
+
+	if total != partSize {
+		t.Errorf("sum of onProgress deltas = %d, want exactly %d (part size) - a mismatch means progress is being over/under-counted", total, partSize)
+	}
+	if maxSeen != partSize {
+		t.Errorf("running total peaked at %d, want it to never exceed %d", maxSeen, partSize)
+	}
+}
+
+const partSize = 262144 // 256KB - large enough to force several Read() chunks over HTTP

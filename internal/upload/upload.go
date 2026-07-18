@@ -508,10 +508,20 @@ func (u *Uploader) uploadPart(ctx context.Context, file *os.File, url string, of
 		// Create section reader for this part
 		section := io.NewSectionReader(file, offset, size)
 
+		// progressReader reports the CUMULATIVE bytes read so far for this
+		// part on every Read() call, but the caller's onProgress callback
+		// (wired into uploadMultipart's shared uploadedBytes counter) expects
+		// an INCREMENTAL delta. last is scoped to this attempt so it resets
+		// to 0 on every retry, converting the cumulative total back into a
+		// per-call delta before it reaches the shared counter.
+		var last int64
 		req, err := http.NewRequestWithContext(uploadCtx, "PUT", url, &progressReader{
-			reader:     section,
-			total:      size,
-			onProgress: func(uploaded, _ int64) { onProgress(uploaded) },
+			reader: section,
+			total:  size,
+			onProgress: func(uploaded, _ int64) {
+				onProgress(uploaded - last)
+				last = uploaded
+			},
 		})
 		if err != nil {
 			return err
