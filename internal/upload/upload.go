@@ -43,9 +43,9 @@ func NewUploader(client *api.Client, verbose bool) *Uploader {
 
 // Result contains the upload result
 type Result struct {
-	FileInfo     *api.FileInfo
-	Collection   *api.CollectionInfo
-	IsCollection bool
+	FileInfo     *api.FileInfo       `json:"file_info,omitempty"`
+	Collection   *api.CollectionInfo `json:"collection,omitempty"`
+	IsCollection bool                `json:"is_collection"`
 }
 
 // UploadFile uploads a single file
