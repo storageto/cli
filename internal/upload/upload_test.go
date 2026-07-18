@@ -3,6 +3,7 @@ package upload
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/storageto/cli/internal/api"
 )
 
 func TestHumanSize(t *testing.T) {
@@ -68,6 +71,60 @@ func TestMin(t *testing.T) {
 	}
 	if min(4, 4) != 4 {
 		t.Error("min(4, 4) should be 4")
+	}
+}
+
+// TestResultJSONShape asserts upload.Result marshals to the snake_case shape
+// documented in README.md ("--json" output), not the bare Go field names.
+// See storageto/cli#5.
+func TestResultJSONShape(t *testing.T) {
+	result := Result{
+		FileInfo: &api.FileInfo{
+			ID:        "abc123",
+			URL:       "https://storage.to/FQxyz1234",
+			Filename:  "photo.jpg",
+			Size:      2097152,
+			HumanSize: "2.0 MB",
+			ExpiresAt: "2026-01-29T12:00:00Z",
+		},
+		IsCollection: false,
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("json.Marshal(Result) error: %v", err)
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+
+	if _, ok := got["file_info"]; !ok {
+		t.Errorf("marshalled Result missing %q key; got %v", "file_info", got)
+	}
+	if _, ok := got["is_collection"]; !ok {
+		t.Errorf("marshalled Result missing %q key; got %v", "is_collection", got)
+	}
+	if _, ok := got["collection"]; ok {
+		t.Errorf("marshalled Result should omit %q when nil (omitempty); got %v", "collection", got)
+	}
+
+	// The old PascalCase field names must be gone.
+	for _, badKey := range []string{"FileInfo", "Collection", "IsCollection"} {
+		if _, ok := got[badKey]; ok {
+			t.Errorf("marshalled Result still has untagged key %q; got %v", badKey, got)
+		}
+	}
+
+	fileInfo, ok := got["file_info"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("file_info is not an object: %v", got["file_info"])
+	}
+	for _, key := range []string{"id", "url", "filename", "size", "human_size", "expires_at"} {
+		if _, ok := fileInfo[key]; !ok {
+			t.Errorf("file_info missing %q key; got %v", key, fileInfo)
+		}
 	}
 }
 
