@@ -31,6 +31,14 @@ const (
 type Uploader struct {
 	client  *api.Client
 	verbose bool
+	// Suppresses the per-file byte-progress line while a batch is running.
+	//
+	// Set ONCE by uploadFilesBatch before it spawns anything, never from the
+	// upload goroutines. Setting it per-file inside uploadFileToR2 was the
+	// obvious shape and it is a data race - written and read by six goroutines
+	// at once - which `go test -race` reported immediately. Write-before-spawn
+	// needs no synchronisation at all.
+	quietProgress bool
 }
 
 // NewUploader creates a new uploader
@@ -46,6 +54,20 @@ type Result struct {
 	FileInfo     *api.FileInfo       `json:"file_info,omitempty"`
 	Collection   *api.CollectionInfo `json:"collection,omitempty"`
 	IsCollection bool                `json:"is_collection"`
+	// Files that did not make it, with the reason each one failed.
+	//
+	// A partial upload used to be reported ONLY as a line on stderr, so
+	// `storageto upload * -c --json && rm *` deleted the originals after a
+	// silent loss: the JSON was a clean collection and the exit code was 0.
+	// Anything scripting this needs the failures in the payload it parses and
+	// in the status it checks.
+	Failed []FailedFile `json:"failed,omitempty"`
+}
+
+// FailedFile is one file that did not upload, and why.
+type FailedFile struct {
+	Filename string `json:"filename"`
+	Reason   string `json:"reason"`
 }
 
 // UploadFile uploads a single file
@@ -115,6 +137,10 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 }
 
 // fileMetadata holds information about a file to upload
+// batchMode suppresses the per-file byte-progress line. Six concurrent files
+// each writing "\r  n B / m B (x%)" to the same line as the batch's own
+// "\r  Uploaded n/m files" is seven writers to one line, which is exactly as
+// readable as it sounds.
 type fileMetadata struct {
 	path        string
 	filename    string
@@ -125,6 +151,16 @@ type fileMetadata struct {
 	uploadURL string
 	r2Key     string
 	uploadErr error
+	// Multipart, when init answered with type "multipart" rather than "single".
+	// The batch path used to read only uploadURL, which multipart init does not
+	// return - so every file at or over the 50MB threshold was skipped, and
+	// skipped without setting uploadErr, which then let it through the confirm
+	// filter below as if its bytes were in R2.
+	multipart *api.InitUploadResponse
+	// Positively set when the bytes are actually in R2. Confirm keys off THIS,
+	// never off r2Key: init hands out an r2Key before a single byte moves, so a
+	// key alone says only that we asked for somewhere to put the file.
+	uploaded bool
 }
 
 // UploadFiles uploads multiple files, optionally as a collection
@@ -214,13 +250,33 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		// Store results
 		for i, f := range batch {
 			idxStr := strconv.Itoa(i)
-			if result, ok := initResp.Results[idxStr]; ok {
-				if result.Error != "" {
-					f.uploadErr = fmt.Errorf("%s", result.Error)
-				} else {
-					f.uploadURL = result.UploadURL
-					f.r2Key = result.R2Key
+			result, ok := initResp.Results[idxStr]
+			if !ok {
+				// The server answered the batch but said nothing about this
+				// element. Silently dropping it is what made a short collection
+				// look like a complete one.
+				f.uploadErr = fmt.Errorf("server returned no upload configuration")
+				continue
+			}
+			switch {
+			case result.Error != "":
+				f.uploadErr = fmt.Errorf("%s", result.Error)
+			case result.UploadURL != "":
+				f.uploadURL = result.UploadURL
+				f.r2Key = result.R2Key
+			case result.UploadID != "":
+				f.r2Key = result.R2Key
+				f.multipart = &api.InitUploadResponse{
+					Success:     true,
+					Type:        result.Type,
+					UploadID:    result.UploadID,
+					R2Key:       result.R2Key,
+					PartSize:    result.PartSize,
+					TotalParts:  result.TotalParts,
+					InitialURLs: result.InitialURLs,
 				}
+			default:
+				f.uploadErr = fmt.Errorf("server returned neither an upload URL nor a multipart session")
 			}
 		}
 	}
@@ -228,17 +284,42 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 	// Step 4: Upload to R2 concurrently (6 at a time)
 	fmt.Printf("Uploading %d files (6 concurrent)...\n", len(files))
 
+	// Before any goroutine exists: six files each writing their own byte
+	// progress to the same line as "Uploaded n/m files" is seven writers to one
+	// line. Only the batch counter writes from here.
+	u.quietProgress = true
+	defer func() { u.quietProgress = false }()
+
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrentFiles)
 	var uploadedCount int64
 	var errorCount int64
+	// Named, so the summary can say WHICH files failed and why. A bare count
+	// ("Warning: 43 files failed") is not something anyone can act on.
+	//
+	// Appended from three places - the pre-upload skip below, the upload
+	// goroutines, and the confirm loop - so every one of them goes through
+	// addFailed. The first version guarded only the goroutine and `go test
+	// -race` caught it: an init-rejected file and an in-flight upload failure
+	// is an ordinary combination, not a corner case.
+	var failed []*fileMetadata
+	var failedMu sync.Mutex
+	addFailed := func(fm *fileMetadata) {
+		failedMu.Lock()
+		defer failedMu.Unlock()
+		failed = append(failed, fm)
+	}
 
 	for _, f := range files {
 		if ctx.Err() != nil {
 			break
 		}
-		if f.uploadErr != nil || f.uploadURL == "" {
+		if f.uploadErr == nil && f.uploadURL == "" && f.multipart == nil {
+			f.uploadErr = fmt.Errorf("no upload configuration")
+		}
+		if f.uploadErr != nil {
 			atomic.AddInt64(&errorCount, 1)
+			addFailed(f)
 			continue
 		}
 
@@ -253,7 +334,9 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 			if err != nil {
 				fm.uploadErr = err
 				atomic.AddInt64(&errorCount, 1)
+				addFailed(fm)
 			} else {
+				fm.uploaded = true
 				n := atomic.AddInt64(&uploadedCount, 1)
 				fmt.Printf("\r  Uploaded %d/%d files", n, len(files))
 			}
@@ -268,7 +351,7 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 	// Collect successfully uploaded files
 	var toConfirm []*fileMetadata
 	for _, f := range files {
-		if f.uploadErr == nil && f.r2Key != "" {
+		if f.uploaded {
 			toConfirm = append(toConfirm, f)
 		}
 	}
@@ -295,10 +378,26 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 			}
 		}
 
-		// Call confirm-batch
-		_, err := u.client.ConfirmUploadBatch(ctx, confirmReq)
+		// Call confirm-batch. The per-file results used to be discarded, which
+		// meant a file whose bytes reached R2 but whose DB row was refused
+		// (blocked extension, blocked hash, a key already claimed) vanished
+		// from the count with nothing said.
+		confirmResp, err := u.client.ConfirmUploadBatch(ctx, confirmReq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to confirm batch: %w", err)
+		}
+		for i, f := range batch {
+			result, ok := confirmResp.Results[strconv.Itoa(i)]
+			if !ok {
+				f.uploadErr = fmt.Errorf("upload confirmed nothing back")
+			} else if !result.Success {
+				f.uploadErr = fmt.Errorf("%s", firstNonEmpty(result.Error, "rejected on confirm"))
+			} else {
+				continue
+			}
+			f.uploaded = false
+			atomic.AddInt64(&errorCount, 1)
+			addFailed(f)
 		}
 	}
 
@@ -308,13 +407,28 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		return nil, fmt.Errorf("failed to finalize collection: %w", err)
 	}
 
-	if errorCount > 0 {
-		fmt.Printf("Warning: %d files failed to upload\n", errorCount)
+	failedMu.Lock()
+	failedFiles := make([]FailedFile, 0, len(failed))
+	for _, f := range failed {
+		reason := "upload failed"
+		if f.uploadErr != nil {
+			reason = f.uploadErr.Error()
+		}
+		failedFiles = append(failedFiles, FailedFile{Filename: f.filename, Reason: reason})
+	}
+	failedMu.Unlock()
+
+	if len(failedFiles) > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d of %d files did not upload:\n", len(failedFiles), len(files))
+		for _, f := range failedFiles {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", f.Filename, f.Reason)
+		}
 	}
 
 	return &Result{
 		Collection:   readyResp.Collection,
 		IsCollection: true,
+		Failed:       failedFiles,
 	}, nil
 }
 
@@ -326,6 +440,9 @@ func (u *Uploader) uploadFileToR2(ctx context.Context, fm *fileMetadata) error {
 	}
 	defer func() { _ = file.Close() }()
 
+	if fm.multipart != nil {
+		return u.uploadMultipart(ctx, file, fm.multipart, fm.size)
+	}
 	return u.uploadSingle(ctx, file, fm.uploadURL, fm.contentType, fm.size)
 }
 
@@ -383,18 +500,33 @@ func (u *Uploader) uploadSingle(ctx context.Context, file *os.File, uploadURL st
 }
 
 // uploadMultipart uploads a file in multiple parts
-func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp *api.InitUploadResponse, size int64) error {
+func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp *api.InitUploadResponse, size int64) (err error) {
 	u.log("Multipart upload: %d parts, %s each\n", initResp.TotalParts, humanSize(initResp.PartSize))
 
-	// Abort cleanup on cancellation
+	// Release the R2 session on ANY terminal outcome, not just Ctrl-C.
+	//
+	// This used to fire only when ctx was cancelled, so a part that exhausted
+	// its retries left the multipart session open: its parts stayed billed
+	// until the 24h reaper, and its `uploads` row went on counting against the
+	// server's per-IP concurrent-multipart ceiling for the whole window. On the
+	// single-file path that cost one session. From the batch path, which now
+	// reaches this function for every large file in a collection, a flaky run
+	// of big files could park hundreds and lock the user out of multipart
+	// entirely - so it has to be fixed in the same change that makes the batch
+	// path reach here at all.
+	//
+	// Named return, because the interesting case is exactly the one where we
+	// are returning an error rather than being cancelled.
 	defer func() {
-		if ctx.Err() != nil && initResp.UploadID != "" {
-			// Best effort abort - use background context since main ctx is cancelled
+		if (err != nil || ctx.Err() != nil) && initResp.UploadID != "" {
+			// Its own context: the caller's may already be cancelled, and an
+			// abort on a dead context is the case that most needs to run.
 			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			// Best effort: the upload is already being cancelled.
+			// Best effort. A failed abort leaves the reaper to it, which is
+			// what happened to every one of these before.
 			_ = u.client.AbortUpload(abortCtx, initResp.UploadID)
-			u.log("Cleaned up partial upload\n")
+			u.log("Released the partial upload\n")
 		}
 	}()
 
@@ -485,7 +617,7 @@ func (u *Uploader) uploadMultipart(ctx context.Context, file *os.File, initResp 
 	}
 
 	// Complete multipart upload. CRC-32 is computed server-side from R2.
-	_, err := u.client.CompleteMultipart(ctx, &api.CompleteMultipartRequest{
+	_, err = u.client.CompleteMultipart(ctx, &api.CompleteMultipartRequest{
 		UploadID: initResp.UploadID,
 		Parts:    parts,
 	})
@@ -589,6 +721,9 @@ func (u *Uploader) log(format string, args ...interface{}) {
 }
 
 func (u *Uploader) printProgress(uploaded, total int64) {
+	if u.quietProgress {
+		return
+	}
 	pct := float64(uploaded) / float64(total) * 100
 	fmt.Printf("\r  %s / %s (%.1f%%)  ", humanSize(uploaded), humanSize(total), pct)
 }
@@ -703,6 +838,16 @@ func generatePartNumbers(start, end int) []int {
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+// firstNonEmpty returns a, or b when a is blank. The server does not always
+// attach a reason to a per-file rejection, and "" reads as a bug rather than
+// as a refusal.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
 		return a
 	}
 	return b
