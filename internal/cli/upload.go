@@ -126,5 +126,14 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// A partial upload is not a success. Exiting 0 here is what let
+	// `storageto upload * -c && rm *` delete the originals after files had
+	// silently failed - the collection URL printed above is real, it is just
+	// short. The failures are on stderr (and in `failed` for --json); this is
+	// the status a script actually branches on.
+	if len(result.Failed) > 0 {
+		return fmt.Errorf("%d file(s) did not upload", len(result.Failed))
+	}
+
 	return nil
 }
