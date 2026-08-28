@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -74,20 +75,22 @@ func parseExpire(value string) (int, error) {
 	return days, nil
 }
 
-// uploadOptions validates the lifetime/download flags together.
-func uploadOptions(expire string, burnAfter bool, maxDownloads int) (upload.Options, error) {
+// uploadOptions validates the lifetime/download flags together. maxSet says
+// whether --max-downloads was given at all: an explicit 0 is a mistake to
+// refuse, not "unlimited".
+func uploadOptions(expire string, burnAfter bool, maxDownloads int, maxSet bool) (upload.Options, error) {
 	days, err := parseExpire(expire)
 	if err != nil {
 		return upload.Options{}, err
 	}
+	if maxSet && (maxDownloads < 1 || maxDownloads > 1000) {
+		return upload.Options{}, fmt.Errorf("--max-downloads must be between 1 and 1000, got %d", maxDownloads)
+	}
 	if burnAfter {
-		if maxDownloads > 1 {
+		if maxSet && maxDownloads != 1 {
 			return upload.Options{}, fmt.Errorf("--burn-after means --max-downloads 1; drop one of them")
 		}
 		maxDownloads = 1
-	}
-	if maxDownloads < 0 || maxDownloads > 1000 {
-		return upload.Options{}, fmt.Errorf("--max-downloads must be between 1 and 1000, got %d", maxDownloads)
 	}
 	return upload.Options{ExpiryDays: days, MaxDownloads: maxDownloads}, nil
 }
@@ -136,7 +139,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no files to upload")
 	}
 
-	opts, err := uploadOptions(expire, burnAfter, maxDownloads)
+	opts, err := uploadOptions(expire, burnAfter, maxDownloads, cmd.Flags().Changed("max-downloads"))
 	if err != nil {
 		return err
 	}
@@ -162,6 +165,12 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	// Do the upload
 	result, err := uploader.UploadFiles(ctx, files, asCollection)
 	if err != nil {
+		// A live-but-uncapped upload outranks the cancel message: Ctrl+C
+		// between confirm and the settings call is exactly how it happens.
+		var live *upload.LiveUploadError
+		if errors.As(err, &live) {
+			return err
+		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("upload cancelled")
 		}

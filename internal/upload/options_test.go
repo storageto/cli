@@ -3,6 +3,7 @@ package upload
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -147,5 +148,18 @@ func TestSingleRollbackFailureNamesURL(t *testing.T) {
 	_, err := u.UploadFile(context.Background(), path, "")
 	if err == nil || !strings.Contains(err.Error(), "https://storage.to/F1") || !strings.Contains(err.Error(), "could not be removed") {
 		t.Fatalf("error = %v, want the live URL", err)
+	}
+}
+
+// The rollback failure is a typed error carrying the live URL, so the CLI can
+// refuse to turn it into a bare "upload cancelled".
+func TestSingleRollbackFailureIsTyped(t *testing.T) {
+	s, u, path := newSingle(t)
+	s.refuseMax, s.refuseDel = true, true
+	u.Options = Options{MaxDownloads: 1}
+	_, err := u.UploadFile(context.Background(), path, "")
+	var live *LiveUploadError
+	if !errors.As(err, &live) || live.URL != "https://storage.to/F1" {
+		t.Fatalf("error = %v (%T), want *LiveUploadError with the URL", err, err)
 	}
 }

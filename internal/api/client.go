@@ -203,6 +203,8 @@ type ConfirmBatchResult struct {
 	Success bool      `json:"success"`
 	Error   string    `json:"error,omitempty"`
 	File    *FileInfo `json:"file,omitempty"`
+	// Per-element proof of ownership; see ConfirmUploadResponse.OwnerToken.
+	OwnerToken string `json:"owner_token,omitempty"`
 }
 
 // ConfirmBatchResponse from /api/upload/confirm-batch

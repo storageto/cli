@@ -2,6 +2,7 @@ package upload
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,6 +52,31 @@ type Options struct {
 	// Maximum successful downloads before the upload is gone; 1 is
 	// burn-after-reading. Zero means unlimited.
 	MaxDownloads int
+}
+
+// LiveUploadError is returned when an upload's requested settings could not
+// be applied AND the compensating delete failed too. The URL is live and
+// uncapped; whoever gets this error must see it, whatever else went wrong
+// (including the Ctrl+C that probably caused it).
+type LiveUploadError struct {
+	URL string
+	Err error
+}
+
+func (e *LiveUploadError) Error() string {
+	return fmt.Sprintf("%v (and it could not be removed; it is live at %s)", e.Err, e.URL)
+}
+
+func (e *LiveUploadError) Unwrap() error { return e.Err }
+
+// rollbackTimeout bounds the compensating delete. It runs on its own context:
+// the usual reason the settings call failed is that the user's ctx was
+// cancelled, and a delete issued on that same ctx would fail identically,
+// leaving the file up.
+const rollbackTimeout = 30 * time.Second
+
+func rollbackContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), rollbackTimeout)
 }
 
 // MaxExpiryDays is the longest lifetime the API grants an anonymous upload.
@@ -160,10 +186,13 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 	// burn is worse than no link, so roll the upload back and fail loudly.
 	if u.Options.MaxDownloads > 0 {
 		if err := u.client.SetFileMaxDownloads(ctx, confirmResp.File.ID, confirmResp.OwnerToken, u.Options.MaxDownloads); err != nil {
-			if delErr := u.client.DeleteFile(ctx, confirmResp.File.ID, confirmResp.OwnerToken); delErr != nil {
-				return nil, fmt.Errorf("failed to set max downloads: %w (and the file could not be removed: %v; it is live at %s)", err, delErr, confirmResp.File.URL)
+			err = fmt.Errorf("failed to set max downloads: %w", err)
+			rctx, cancel := rollbackContext()
+			defer cancel()
+			if delErr := u.client.DeleteFile(rctx, confirmResp.File.ID, confirmResp.OwnerToken); delErr != nil {
+				return nil, &LiveUploadError{URL: confirmResp.File.URL, Err: fmt.Errorf("%w; delete failed: %v", err, delErr)}
 			}
-			return nil, fmt.Errorf("failed to set max downloads: %w (upload removed)", err)
+			return nil, fmt.Errorf("%w (upload removed)", err)
 		}
 		confirmResp.File.MaxDownloads = u.Options.MaxDownloads
 	}
@@ -196,6 +225,10 @@ type fileMetadata struct {
 	// never off r2Key: init hands out an r2Key before a single byte moves, so a
 	// key alone says only that we asked for somewhere to put the file.
 	uploaded bool
+	// Set by confirm-batch for a confirmed row: the file id and the owner
+	// token that authorises the per-file settings calls.
+	fileID     string
+	ownerToken string
 }
 
 // UploadFiles uploads multiple files, optionally as a collection
@@ -429,7 +462,11 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 				f.uploadErr = fmt.Errorf("upload confirmed nothing back")
 			} else if !result.Success {
 				f.uploadErr = fmt.Errorf("%s", firstNonEmpty(result.Error, "rejected on confirm"))
+			} else if result.File == nil || result.File.ID == "" {
+				f.uploadErr = fmt.Errorf("upload confirmed without a file id")
 			} else {
+				f.fileID = result.File.ID
+				f.ownerToken = result.OwnerToken
 				continue
 			}
 			f.uploaded = false
@@ -446,9 +483,11 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 	//
 	// Same rollback rule as the single-file path: a collection that did not
 	// get the settings it was asked for is deleted, not handed out.
-	if err := u.applyCollectionOptions(ctx, collectionID, ownerToken); err != nil {
-		if delErr := u.client.DeleteCollection(ctx, collectionID, ownerToken); delErr != nil {
-			return nil, fmt.Errorf("%w (and the collection could not be removed: %v; it is live at %s)", err, delErr, collResp.Collection.URL)
+	if err := u.applyCollectionOptions(ctx, collectionID, ownerToken, files); err != nil {
+		rctx, cancel := rollbackContext()
+		defer cancel()
+		if delErr := u.client.DeleteCollection(rctx, collectionID, ownerToken); delErr != nil {
+			return nil, &LiveUploadError{URL: collResp.Collection.URL, Err: fmt.Errorf("%w; delete failed: %v", err, delErr)}
 		}
 		return nil, fmt.Errorf("%w (upload removed)", err)
 	}
@@ -488,19 +527,62 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 	}, nil
 }
 
-// applyCollectionOptions pushes Options onto a live collection row.
-func (u *Uploader) applyCollectionOptions(ctx context.Context, collectionID, ownerToken string) error {
+// applyCollectionOptions pushes Options onto a live collection and its
+// confirmed members.
+//
+// The download cap goes on EVERY row, not just the collection: the
+// collection's own counter only moves on "download all as ZIP", while a
+// member fetched on its own is counted and burned against the member's own
+// max_downloads. Capping only the wrapper would hand out a --burn-after
+// collection whose files could each be pulled forever.
+func (u *Uploader) applyCollectionOptions(ctx context.Context, collectionID, ownerToken string, files []*fileMetadata) error {
 	if u.Options.ExpiryDays > 0 {
 		if err := u.client.SetCollectionExpiry(ctx, collectionID, ownerToken, u.Options.ExpiryDays); err != nil {
 			return fmt.Errorf("failed to set collection expiry: %w", err)
 		}
 	}
-	if u.Options.MaxDownloads > 0 {
-		if err := u.client.SetCollectionMaxDownloads(ctx, collectionID, ownerToken, u.Options.MaxDownloads); err != nil {
-			return fmt.Errorf("failed to set max downloads: %w", err)
+	if u.Options.MaxDownloads == 0 {
+		return nil
+	}
+	if err := u.client.SetCollectionMaxDownloads(ctx, collectionID, ownerToken, u.Options.MaxDownloads); err != nil {
+		return fmt.Errorf("failed to set max downloads: %w", err)
+	}
+
+	var members []*fileMetadata
+	for _, f := range files {
+		if f.uploadErr == nil && f.fileID != "" {
+			members = append(members, f)
 		}
 	}
-	return nil
+	// One call per member, a few at a time. Serial would make a big
+	// --burn-after collection crawl; unbounded would trip the API's per-IP
+	// rate limit on the same big collection.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrentFiles)
+	errs := make(chan error, len(members))
+	for _, f := range members {
+		wg.Add(1)
+		go func(f *fileMetadata) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+			if err := u.client.SetFileMaxDownloads(ctx, f.fileID, f.ownerToken, u.Options.MaxDownloads); err != nil {
+				errs <- fmt.Errorf("failed to set max downloads on %s: %w", f.filename, err)
+			}
+		}(f)
+	}
+	wg.Wait()
+	close(errs)
+	var all []error
+	for err := range errs {
+		all = append(all, err)
+	}
+	return errors.Join(all...)
 }
 
 // uploadFileToR2 uploads a single file to R2 using a presigned URL

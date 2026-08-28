@@ -99,9 +99,10 @@ storageto upload *.log --expire 7d --burn-after  # works for collections too
 ```
 
 `--expire` takes whole days from `1d` to `7d` (anything longer needs a
-storage.to account, which the CLI does not sign in to). A file or collection
-that could not be given the settings you asked for is deleted rather than
-handed out, and the command exits non-zero.
+storage.to account, which the CLI does not sign in to). On a collection the
+download cap applies to each file and to the "download all" ZIP, each counted
+separately. A file or collection that could not be given the settings you
+asked for is deleted rather than handed out, and the command exits non-zero.
 
 ### JSON output
 

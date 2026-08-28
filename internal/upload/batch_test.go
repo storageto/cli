@@ -33,16 +33,21 @@ type batchServer struct {
 	confirmExpiry any
 	refuseExpiry  bool
 	deleted       []string
+	// Called from the collection max-downloads handler before it answers;
+	// used to cancel the caller's ctx mid-flight.
+	onCollectionMax func()
+	refuseFileMax   map[string]bool // file id -> 400
 }
 
 func newBatchServer() *batchServer {
 	return &batchServer{
-		putFailure:  map[string]bool{},
-		confirmFail: map[string]bool{},
-		initErr:     map[int]bool{},
-		multipart:   map[int]bool{},
-		partsSeen:   map[string]int{},
-		ownerSeen:   map[string]string{},
+		putFailure:    map[string]bool{},
+		confirmFail:   map[string]bool{},
+		initErr:       map[int]bool{},
+		multipart:     map[int]bool{},
+		partsSeen:     map[string]int{},
+		ownerSeen:     map[string]string{},
+		refuseFileMax: map[string]bool{},
 	}
 }
 
@@ -69,7 +74,21 @@ func (b *batchServer) handler(t *testing.T, base *string) http.HandlerFunc {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "expires_at": "2026-09-01T00:00:00+00:00"})
 		case r.URL.Path == "/api/collection/col1/max-downloads":
+			if b.onCollectionMax != nil {
+				b.onCollectionMax()
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "max_downloads": 1})
+		case strings.HasPrefix(r.URL.Path, "/api/file/") && strings.HasSuffix(r.URL.Path, "/max-downloads"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/file/"), "/max-downloads")
+			b.mu.Lock()
+			refuse := b.refuseFileMax[id]
+			b.mu.Unlock()
+			if refuse {
+				w.WriteHeader(400)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "nope"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 		case r.URL.Path == "/api/collection/col1" && r.Method == "DELETE":
 			b.mu.Lock()
 			b.deleted = append(b.deleted, "col1")
@@ -168,7 +187,8 @@ func (b *batchServer) handler(t *testing.T, base *string) http.HandlerFunc {
 					results[strconv.Itoa(i)] = map[string]any{"success": false, "error": "blocked"}
 				} else {
 					results[strconv.Itoa(i)] = map[string]any{"success": true,
-						"file": map[string]any{"id": f.R2Key, "url": "https://x/" + f.R2Key}}
+						"file":        map[string]any{"id": f.R2Key, "url": "https://x/" + f.R2Key},
+						"owner_token": "owner-" + f.R2Key}
 				}
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "results": results})
@@ -286,6 +306,14 @@ func TestBatchOptionsAppliedBeforeReady(t *testing.T) {
 			t.Errorf("%s owner token = %q, want owner-col1", p, b.ownerSeen[p])
 		}
 	}
+	// Every member is capped too, each with ITS OWN owner token: a member
+	// fetched on its own burns against the member's cap, not the collection's.
+	for i := 0; i < 3; i++ {
+		p := fmt.Sprintf("/api/file/k%d/max-downloads", i)
+		if b.ownerSeen[p] != fmt.Sprintf("owner-k%d", i) {
+			t.Errorf("%s owner token = %q, want owner-k%d", p, b.ownerSeen[p], i)
+		}
+	}
 	idx := func(want string) int {
 		for i, p := range b.paths {
 			if p == want {
@@ -296,8 +324,10 @@ func TestBatchOptionsAppliedBeforeReady(t *testing.T) {
 		return -1
 	}
 	ready := idx("POST /api/collection/col1/ready")
-	if idx("POST /api/collection/col1/expiry") > ready || idx("POST /api/collection/col1/max-downloads") > ready {
-		t.Errorf("management calls after ready: %v", b.paths)
+	for _, p := range []string{"POST /api/collection/col1/expiry", "POST /api/collection/col1/max-downloads", "POST /api/file/k0/max-downloads", "POST /api/file/k2/max-downloads"} {
+		if idx(p) > ready {
+			t.Errorf("%s after ready: %v", p, b.paths)
+		}
 	}
 	if res.Collection.MaxDownloads != 1 {
 		t.Errorf("Collection.MaxDownloads = %d, want 1", res.Collection.MaxDownloads)
@@ -351,5 +381,57 @@ func TestBatchOptionFailureRollsBack(t *testing.T) {
 		if strings.HasSuffix(p, "/ready") {
 			t.Errorf("ready was called after the settings failed: %v", b.paths)
 		}
+	}
+}
+
+// A member that could not be capped takes the whole collection down: the
+// link must never go out with one file that can be pulled forever. Members
+// that failed to upload are simply not capped (they have no row).
+func TestBatchMemberCapFailureRollsBack(t *testing.T) {
+	b := newBatchServer()
+	b.refuseFileMax["k1"] = true
+	b.putFailure["k2"] = true
+	var base string
+	srv := httptest.NewServer(b.handler(t, &base))
+	defer srv.Close()
+	base = srv.URL
+
+	u := NewUploader(api.NewClient(srv.URL, ""), false)
+	u.Options = Options{MaxDownloads: 1}
+	_, err := u.uploadFilesBatch(context.Background(), makeFiles(t, 3, 4))
+	if err == nil || !strings.Contains(err.Error(), "f001.bin") || !strings.Contains(err.Error(), "upload removed") {
+		t.Fatalf("error = %v, want the member name and 'upload removed'", err)
+	}
+	if len(b.deleted) != 1 {
+		t.Errorf("collection not deleted: %v", b.paths)
+	}
+	for _, p := range b.paths {
+		if p == "POST /api/file/k2/max-downloads" {
+			t.Errorf("a member that never uploaded was capped: %v", b.paths)
+		}
+	}
+}
+
+// Ctrl+C while the settings are being applied: the rollback must still run
+// (on its own context) and, if it cannot, the error must say the URL rather
+// than dissolve into the cancel.
+func TestBatchRollbackSurvivesCancelledContext(t *testing.T) {
+	b := newBatchServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.onCollectionMax = cancel
+	var base string
+	srv := httptest.NewServer(b.handler(t, &base))
+	defer srv.Close()
+	base = srv.URL
+
+	u := NewUploader(api.NewClient(srv.URL, ""), false)
+	u.Options = Options{MaxDownloads: 1}
+	_, err := u.uploadFilesBatch(ctx, makeFiles(t, 2, 4))
+	if err == nil {
+		t.Fatal("want an error after cancel")
+	}
+	if len(b.deleted) != 1 {
+		t.Errorf("rollback did not run on the cancelled ctx: %v (err %v)", b.paths, err)
 	}
 }

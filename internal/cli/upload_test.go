@@ -40,31 +40,40 @@ func TestParseExpire(t *testing.T) {
 }
 
 func TestUploadOptions(t *testing.T) {
-	opts, err := uploadOptions("", false, 0)
+	opts, err := uploadOptions("", false, 0, false)
 	if err != nil || opts.ExpiryDays != 0 || opts.MaxDownloads != 0 {
 		t.Fatalf("defaults: got %+v, %v; want zero options", opts, err)
 	}
 
-	opts, err = uploadOptions("2d", true, 0)
+	opts, err = uploadOptions("2d", true, 0, false)
 	if err != nil || opts.ExpiryDays != 2 || opts.MaxDownloads != 1 {
 		t.Fatalf("--expire 2d --burn-after: got %+v, %v", opts, err)
 	}
 
 	// --burn-after with an explicit --max-downloads 1 is redundant, not wrong.
-	if _, err := uploadOptions("", true, 1); err != nil {
+	if _, err := uploadOptions("", true, 1, true); err != nil {
 		t.Errorf("--burn-after --max-downloads 1: unexpected error %v", err)
 	}
-	if _, err := uploadOptions("", true, 5); err == nil {
+	if _, err := uploadOptions("", true, 5, true); err == nil {
 		t.Error("--burn-after --max-downloads 5: want a conflict error")
 	}
-	if _, err := uploadOptions("", false, 1001); err == nil {
+	// A bad value is a range error even alongside --burn-after, never
+	// silently overwritten to 1.
+	if _, err := uploadOptions("", true, -5, true); err == nil || !strings.Contains(err.Error(), "between 1 and 1000") {
+		t.Errorf("--burn-after --max-downloads -5: got %v, want a range error", err)
+	}
+	if _, err := uploadOptions("", false, 1001, true); err == nil {
 		t.Error("--max-downloads 1001: want a range error")
 	}
-	if _, err := uploadOptions("", false, -1); err == nil {
+	if _, err := uploadOptions("", false, -1, true); err == nil {
 		t.Error("--max-downloads -1: want a range error")
 	}
+	// An explicit 0 is refused; it is not a spelling of "unlimited".
+	if _, err := uploadOptions("", false, 0, true); err == nil {
+		t.Error("--max-downloads 0: want a range error")
+	}
 	// A bad --expire is reported even when the download flags are fine.
-	if _, err := uploadOptions("9d", false, 0); err == nil {
+	if _, err := uploadOptions("9d", false, 0, false); err == nil {
 		t.Error("--expire 9d: want a range error")
 	}
 }
