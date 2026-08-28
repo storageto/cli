@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -66,5 +70,105 @@ func TestFileInfoUnmarshalIgnoresRawURL(t *testing.T) {
 	}
 	if strings.Contains(string(out), "r/FQxyz1234") {
 		t.Errorf("round-trip should drop the raw hotlink, got %s", out)
+	}
+}
+
+// The management calls run after the upload is live and must prove ownership
+// with the owner token confirm handed back, because --no-token leaves the
+// visitor token empty and the server's ownership ladder has nothing else to
+// go on.
+func TestManagementCallsSendOwnerTokenAndBody(t *testing.T) {
+	type seen struct {
+		method, path, owner, visitor string
+		body                         map[string]any
+	}
+	var calls []seen
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		calls = append(calls, seen{r.Method, r.URL.Path, r.Header.Get("X-Owner-Token"), r.Header.Get("X-Visitor-Token"), body})
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	ctx := context.Background()
+	if err := c.SetFileMaxDownloads(ctx, "F1", "tok-f", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetFileExpiry(ctx, "F1", "tok-f", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteFile(ctx, "F1", "tok-f"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetCollectionExpiry(ctx, "C1", "tok-c", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetCollectionMaxDownloads(ctx, "C1", "tok-c", 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteCollection(ctx, "C1", "tok-c"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []seen{
+		{"POST", "/api/file/F1/max-downloads", "tok-f", "", map[string]any{"max_downloads": float64(1)}},
+		{"POST", "/api/file/F1/expiry", "tok-f", "", map[string]any{"days": float64(2)}},
+		{"DELETE", "/api/file/F1", "tok-f", "", map[string]any{}},
+		{"POST", "/api/collection/C1/expiry", "tok-c", "", map[string]any{"days": float64(7)}},
+		{"POST", "/api/collection/C1/max-downloads", "tok-c", "", map[string]any{"max_downloads": float64(5)}},
+		{"DELETE", "/api/collection/C1", "tok-c", "", map[string]any{}},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("got %d calls, want %d: %+v", len(calls), len(want), calls)
+	}
+	for i := range want {
+		if calls[i].method != want[i].method || calls[i].path != want[i].path || calls[i].owner != want[i].owner || calls[i].visitor != want[i].visitor {
+			t.Errorf("call %d = %+v, want %+v", i, calls[i], want[i])
+		}
+		if fmt.Sprint(calls[i].body) != fmt.Sprint(want[i].body) {
+			t.Errorf("call %d body = %v, want %v", i, calls[i].body, want[i].body)
+		}
+	}
+}
+
+// A management call that the server refuses surfaces the server's message,
+// and a 403 (not the owner) is not mistaken for success.
+func TestManagementCallSurfacesServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "Unauthorized"})
+	}))
+	defer srv.Close()
+	err := NewClient(srv.URL, "").SetFileMaxDownloads(context.Background(), "F1", "", 1)
+	if err == nil || !strings.Contains(err.Error(), "Unauthorized") {
+		t.Fatalf("error = %v, want the server's Unauthorized", err)
+	}
+}
+
+// expiry_days and max_downloads are omitted from the wire and from --json
+// output when unset, so a default upload's requests and output are unchanged.
+func TestOptionalFieldsOmittedWhenZero(t *testing.T) {
+	for name, v := range map[string]any{
+		"ConfirmUploadRequest": ConfirmUploadRequest{Filename: "a", R2Key: "k"},
+		"ConfirmBatchRequest":  ConfirmBatchRequest{Files: []BatchConfirmFile{}},
+		"FileInfo":             FileInfo{ID: "F1"},
+		"CollectionInfo":       CollectionInfo{ID: "C1"},
+	} {
+		data, _ := json.Marshal(v)
+		for _, key := range []string{"expiry_days", "max_downloads"} {
+			if strings.Contains(string(data), key) {
+				t.Errorf("%s zero value marshals %q: %s", name, key, data)
+			}
+		}
+	}
+	data, _ := json.Marshal(ConfirmUploadRequest{Filename: "a", R2Key: "k", ExpiryDays: 3})
+	if !strings.Contains(string(data), `"expiry_days":3`) {
+		t.Errorf("ConfirmUploadRequest with ExpiryDays lacks the field: %s", data)
+	}
+	data, _ = json.Marshal(FileInfo{ID: "F1", MaxDownloads: 1})
+	if !strings.Contains(string(data), `"max_downloads":1`) {
+		t.Errorf("FileInfo with MaxDownloads lacks the field: %s", data)
 	}
 }

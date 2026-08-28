@@ -89,6 +89,9 @@ type ConfirmUploadRequest struct {
 	ContentType  string `json:"content_type"`
 	R2Key        string `json:"r2_key"`
 	CollectionID string `json:"collection_id,omitempty"`
+	// Days until the file expires (1..MaxExpiryDays). Zero sends nothing and
+	// the server applies its default.
+	ExpiryDays int `json:"expiry_days,omitempty"`
 }
 
 // ConfirmUploadResponse from /api/upload/confirm
@@ -96,6 +99,10 @@ type ConfirmUploadResponse struct {
 	Success bool      `json:"success"`
 	Error   string    `json:"error,omitempty"`
 	File    *FileInfo `json:"file,omitempty"`
+	// Proof of ownership for the follow-up management calls (max downloads,
+	// delete). Needed because the visitor token is optional (--no-token) and
+	// this is the only credential an anonymous upload ever gets.
+	OwnerToken string `json:"owner_token,omitempty"`
 }
 
 // FileInfo contains information about an uploaded file
@@ -106,6 +113,9 @@ type FileInfo struct {
 	Size      int64  `json:"size"`
 	HumanSize string `json:"human_size"`
 	ExpiresAt string `json:"expires_at"`
+	// Download cap set after confirm (--max-downloads / --burn-after). Zero
+	// means unlimited and is omitted from --json output.
+	MaxDownloads int `json:"max_downloads,omitempty"`
 }
 
 // CreateCollectionRequest for /api/collection
@@ -118,6 +128,8 @@ type CreateCollectionResponse struct {
 	Success    bool            `json:"success"`
 	Error      string          `json:"error,omitempty"`
 	Collection *CollectionInfo `json:"collection,omitempty"`
+	// See ConfirmUploadResponse.OwnerToken.
+	OwnerToken string `json:"owner_token,omitempty"`
 }
 
 // CollectionInfo contains information about a collection
@@ -125,6 +137,8 @@ type CollectionInfo struct {
 	ID        string `json:"id"`
 	URL       string `json:"url"`
 	ExpiresAt string `json:"expires_at"`
+	// See FileInfo.MaxDownloads.
+	MaxDownloads int `json:"max_downloads,omitempty"`
 }
 
 // MarkCollectionReadyResponse from /api/collection/{id}/ready
@@ -180,6 +194,8 @@ type BatchConfirmFile struct {
 type ConfirmBatchRequest struct {
 	CollectionID string             `json:"collection_id,omitempty"`
 	Files        []BatchConfirmFile `json:"files"`
+	// One expiry for every file in the batch; see ConfirmUploadRequest.ExpiryDays.
+	ExpiryDays int `json:"expiry_days,omitempty"`
 }
 
 // ConfirmBatchResult represents the confirm result for a single file
@@ -187,6 +203,8 @@ type ConfirmBatchResult struct {
 	Success bool      `json:"success"`
 	Error   string    `json:"error,omitempty"`
 	File    *FileInfo `json:"file,omitempty"`
+	// Per-element proof of ownership; see ConfirmUploadResponse.OwnerToken.
+	OwnerToken string `json:"owner_token,omitempty"`
 }
 
 // ConfirmBatchResponse from /api/upload/confirm-batch
@@ -308,13 +326,71 @@ func (c *Client) ConfirmUploadBatch(ctx context.Context, req *ConfirmBatchReques
 	return &resp, nil
 }
 
+// Management calls. These run AFTER an upload is live, so they authenticate
+// with the owner token that confirm/create handed back rather than relying on
+// the visitor token, which --no-token leaves empty.
+
+// managementResponse is the shared envelope of the /api/{file,collection}/:id/*
+// management endpoints.
+type managementResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
+// SetFileExpiry sets a file's expiry to now + days.
+func (c *Client) SetFileExpiry(ctx context.Context, fileID, ownerToken string, days int) error {
+	return c.manage(ctx, "POST", fmt.Sprintf("/api/file/%s/expiry", fileID), ownerToken, map[string]int{"days": days})
+}
+
+// SetFileMaxDownloads caps how many times a file can be downloaded; 1 is
+// burn-after-reading.
+func (c *Client) SetFileMaxDownloads(ctx context.Context, fileID, ownerToken string, max int) error {
+	return c.manage(ctx, "POST", fmt.Sprintf("/api/file/%s/max-downloads", fileID), ownerToken, map[string]int{"max_downloads": max})
+}
+
+// DeleteFile removes a file. Used to roll back an upload whose requested
+// settings could not be applied, so a link never goes out weaker than asked.
+func (c *Client) DeleteFile(ctx context.Context, fileID, ownerToken string) error {
+	return c.manage(ctx, "DELETE", fmt.Sprintf("/api/file/%s", fileID), ownerToken, struct{}{})
+}
+
+// SetCollectionExpiry sets a collection's expiry to now + days.
+func (c *Client) SetCollectionExpiry(ctx context.Context, collectionID, ownerToken string, days int) error {
+	return c.manage(ctx, "POST", fmt.Sprintf("/api/collection/%s/expiry", collectionID), ownerToken, map[string]int{"days": days})
+}
+
+// SetCollectionMaxDownloads caps how many times a collection can be downloaded.
+func (c *Client) SetCollectionMaxDownloads(ctx context.Context, collectionID, ownerToken string, max int) error {
+	return c.manage(ctx, "POST", fmt.Sprintf("/api/collection/%s/max-downloads", collectionID), ownerToken, map[string]int{"max_downloads": max})
+}
+
+// DeleteCollection removes a collection and its member files.
+func (c *Client) DeleteCollection(ctx context.Context, collectionID, ownerToken string) error {
+	return c.manage(ctx, "DELETE", fmt.Sprintf("/api/collection/%s", collectionID), ownerToken, struct{}{})
+}
+
+func (c *Client) manage(ctx context.Context, method, path, ownerToken string, body interface{}) error {
+	var resp managementResponse
+	if err := c.do(ctx, method, path, ownerToken, body, &resp); err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
 func (c *Client) post(ctx context.Context, path string, body interface{}, result interface{}) error {
+	return c.do(ctx, "POST", path, "", body, result)
+}
+
+func (c *Client) do(ctx context.Context, method, path, ownerToken string, body interface{}, result interface{}) error {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("failed to encode request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+path, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -324,6 +400,9 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, result
 	req.Header.Set("User-Agent", version.UserAgent())
 	if c.VisitorToken != "" {
 		req.Header.Set("X-Visitor-Token", c.VisitorToken)
+	}
+	if ownerToken != "" {
+		req.Header.Set("X-Owner-Token", ownerToken)
 	}
 
 	resp, err := c.HTTPClient.Do(req)
