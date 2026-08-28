@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/storageto/cli/internal/api"
@@ -16,8 +18,11 @@ import (
 )
 
 var (
-	collection bool
-	jsonOutput bool
+	collection   bool
+	jsonOutput   bool
+	expire       string
+	burnAfter    bool
+	maxDownloads int
 )
 
 var uploadCmd = &cobra.Command{
@@ -29,7 +34,10 @@ Examples:
   storageto upload photo.jpg                    # Single file
   storageto upload doc.pdf image.png            # Multiple files (auto-collection)
   storageto upload *.log --collection           # Explicit collection
-  storageto upload backup.tar.gz                # Large files auto-chunk`,
+  storageto upload backup.tar.gz                # Large files auto-chunk
+  storageto upload secret.pdf --expire 1d       # Gone after one day (1d-7d)
+  storageto upload secret.pdf --burn-after      # Gone after the first download
+  storageto upload build.zip --max-downloads 5  # Gone after five downloads`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runUpload,
 }
@@ -38,6 +46,50 @@ func init() {
 	rootCmd.AddCommand(uploadCmd)
 	uploadCmd.Flags().BoolVarP(&collection, "collection", "c", false, "Create a collection for multiple files")
 	uploadCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output result as JSON")
+	uploadCmd.Flags().StringVar(&expire, "expire", "", fmt.Sprintf("Lifetime in days, 1d to %dd (default 3d)", upload.MaxExpiryDays))
+	uploadCmd.Flags().BoolVar(&burnAfter, "burn-after", false, "Delete after the first download (same as --max-downloads 1)")
+	uploadCmd.Flags().IntVar(&maxDownloads, "max-downloads", 0, "Delete after this many downloads (1-1000)")
+}
+
+// parseExpire turns the --expire value into whole days. Accepts "3", "3d" or
+// "3D"; refuses hours explicitly because the API only has day granularity,
+// and refuses anything over MaxExpiryDays because the server would cap it
+// silently and a script would never know.
+func parseExpire(value string) (int, error) {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if v == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(v, "h") {
+		return 0, fmt.Errorf("--expire is in whole days (1d to %dd), hours are not supported", upload.MaxExpiryDays)
+	}
+	v = strings.TrimSuffix(v, "d")
+	days, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("--expire must be a number of days like 1d or 7d, got %q", value)
+	}
+	if days < 1 || days > upload.MaxExpiryDays {
+		return 0, fmt.Errorf("--expire must be between 1d and %dd, got %s", upload.MaxExpiryDays, value)
+	}
+	return days, nil
+}
+
+// uploadOptions validates the lifetime/download flags together.
+func uploadOptions(expire string, burnAfter bool, maxDownloads int) (upload.Options, error) {
+	days, err := parseExpire(expire)
+	if err != nil {
+		return upload.Options{}, err
+	}
+	if burnAfter {
+		if maxDownloads > 1 {
+			return upload.Options{}, fmt.Errorf("--burn-after means --max-downloads 1; drop one of them")
+		}
+		maxDownloads = 1
+	}
+	if maxDownloads < 0 || maxDownloads > 1000 {
+		return upload.Options{}, fmt.Errorf("--max-downloads must be between 1 and 1000, got %d", maxDownloads)
+	}
+	return upload.Options{ExpiryDays: days, MaxDownloads: maxDownloads}, nil
 }
 
 func runUpload(cmd *cobra.Command, args []string) error {
@@ -84,6 +136,11 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no files to upload")
 	}
 
+	opts, err := uploadOptions(expire, burnAfter, maxDownloads)
+	if err != nil {
+		return err
+	}
+
 	// Auto-collection for multiple files
 	asCollection := collection || len(files) > 1
 
@@ -100,6 +157,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	// Create client and uploader
 	client := api.NewClient(apiURL, visitorToken)
 	uploader := upload.NewUploader(client, verbose)
+	uploader.Options = opts
 
 	// Do the upload
 	result, err := uploader.UploadFiles(ctx, files, asCollection)
@@ -119,10 +177,16 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		if result.IsCollection {
 			fmt.Printf("Collection: %s\n", result.Collection.URL)
 			fmt.Printf("Expires:    %s\n", result.Collection.ExpiresAt)
+			if result.Collection.MaxDownloads > 0 {
+				fmt.Printf("Downloads:  %s\n", describeMaxDownloads(result.Collection.MaxDownloads))
+			}
 		} else {
 			fmt.Printf("URL:     %s\n", result.FileInfo.URL)
 			fmt.Printf("Size:    %s\n", result.FileInfo.HumanSize)
 			fmt.Printf("Expires: %s\n", result.FileInfo.ExpiresAt)
+			if result.FileInfo.MaxDownloads > 0 {
+				fmt.Printf("Downloads: %s\n", describeMaxDownloads(result.FileInfo.MaxDownloads))
+			}
 		}
 	}
 
@@ -136,4 +200,11 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func describeMaxDownloads(max int) string {
+	if max == 1 {
+		return "1 (burn after reading)"
+	}
+	return fmt.Sprintf("max %d", max)
 }

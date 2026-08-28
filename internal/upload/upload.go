@@ -39,7 +39,25 @@ type Uploader struct {
 	// at once - which `go test -race` reported immediately. Write-before-spawn
 	// needs no synchronisation at all.
 	quietProgress bool
+	// Per-upload settings from the command line; the zero value means
+	// "server defaults", which is exactly what every pre-0.5 invocation got.
+	Options Options
 }
+
+// Options are the caller's requested lifetime and download cap.
+type Options struct {
+	// Days until expiry, 1..MaxExpiryDays. Zero leaves the server default.
+	ExpiryDays int
+	// Maximum successful downloads before the upload is gone; 1 is
+	// burn-after-reading. Zero means unlimited.
+	MaxDownloads int
+}
+
+// MaxExpiryDays is the longest lifetime the API grants an anonymous upload.
+// Anything longer needs a premium account, which the CLI has no way to sign
+// in to, so the flag parser refuses it up front instead of letting the server
+// silently cap it.
+const MaxExpiryDays = 7
 
 // NewUploader creates a new uploader
 func NewUploader(client *api.Client, verbose bool) *Uploader {
@@ -128,9 +146,26 @@ func (u *Uploader) UploadFile(ctx context.Context, path string, collectionID str
 		ContentType:  contentType,
 		R2Key:        initResp.R2Key,
 		CollectionID: collectionID,
+		ExpiryDays:   u.Options.ExpiryDays,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to confirm upload: %w", err)
+	}
+	if confirmResp.File == nil {
+		return nil, fmt.Errorf("upload confirmed nothing back")
+	}
+
+	// The download cap is a separate call after the file is live. If it cannot
+	// be applied, the file must not stay up: a --burn-after link that does not
+	// burn is worse than no link, so roll the upload back and fail loudly.
+	if u.Options.MaxDownloads > 0 {
+		if err := u.client.SetFileMaxDownloads(ctx, confirmResp.File.ID, confirmResp.OwnerToken, u.Options.MaxDownloads); err != nil {
+			if delErr := u.client.DeleteFile(ctx, confirmResp.File.ID, confirmResp.OwnerToken); delErr != nil {
+				return nil, fmt.Errorf("failed to set max downloads: %w (and the file could not be removed: %v; it is live at %s)", err, delErr, confirmResp.File.URL)
+			}
+			return nil, fmt.Errorf("failed to set max downloads: %w (upload removed)", err)
+		}
+		confirmResp.File.MaxDownloads = u.Options.MaxDownloads
 	}
 
 	return confirmResp.File, nil
@@ -218,6 +253,7 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collectionID := collResp.Collection.ID
+	ownerToken := collResp.OwnerToken
 	u.log("Created collection %s for %d files\n", collectionID, len(files))
 
 	// Step 3: Batch init - get presigned URLs for all files
@@ -368,6 +404,7 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		confirmReq := &api.ConfirmBatchRequest{
 			CollectionID: collectionID,
 			Files:        make([]api.BatchConfirmFile, len(batch)),
+			ExpiryDays:   u.Options.ExpiryDays,
 		}
 		for i, f := range batch {
 			confirmReq.Files[i] = api.BatchConfirmFile{
@@ -401,11 +438,30 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		}
 	}
 
-	// Step 6: Mark collection ready
+	// Step 6: Apply the requested lifetime and download cap to the collection
+	// itself. The member files already carry expiry_days from confirm-batch;
+	// the collection row has its own expiry (the wrapper page outliving its
+	// files is the legacy default) and its own download counter. Done before
+	// ready so the ready response reports the final expires_at.
+	//
+	// Same rollback rule as the single-file path: a collection that did not
+	// get the settings it was asked for is deleted, not handed out.
+	if err := u.applyCollectionOptions(ctx, collectionID, ownerToken); err != nil {
+		if delErr := u.client.DeleteCollection(ctx, collectionID, ownerToken); delErr != nil {
+			return nil, fmt.Errorf("%w (and the collection could not be removed: %v; it is live at %s)", err, delErr, collResp.Collection.URL)
+		}
+		return nil, fmt.Errorf("%w (upload removed)", err)
+	}
+
+	// Step 7: Mark collection ready
 	readyResp, err := u.client.MarkCollectionReady(ctx, collectionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to finalize collection: %w", err)
 	}
+	if readyResp.Collection == nil {
+		return nil, fmt.Errorf("collection finalized nothing back")
+	}
+	readyResp.Collection.MaxDownloads = u.Options.MaxDownloads
 
 	failedMu.Lock()
 	failedFiles := make([]FailedFile, 0, len(failed))
@@ -430,6 +486,21 @@ func (u *Uploader) uploadFilesBatch(ctx context.Context, paths []string) (*Resul
 		IsCollection: true,
 		Failed:       failedFiles,
 	}, nil
+}
+
+// applyCollectionOptions pushes Options onto a live collection row.
+func (u *Uploader) applyCollectionOptions(ctx context.Context, collectionID, ownerToken string) error {
+	if u.Options.ExpiryDays > 0 {
+		if err := u.client.SetCollectionExpiry(ctx, collectionID, ownerToken, u.Options.ExpiryDays); err != nil {
+			return fmt.Errorf("failed to set collection expiry: %w", err)
+		}
+	}
+	if u.Options.MaxDownloads > 0 {
+		if err := u.client.SetCollectionMaxDownloads(ctx, collectionID, ownerToken, u.Options.MaxDownloads); err != nil {
+			return fmt.Errorf("failed to set max downloads: %w", err)
+		}
+	}
+	return nil
 }
 
 // uploadFileToR2 uploads a single file to R2 using a presigned URL

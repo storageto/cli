@@ -26,6 +26,13 @@ type batchServer struct {
 	completed   []string
 	aborted     []string
 	partsSeen   map[string]int
+	// Options plumbing: every request path in order, the owner token each
+	// management call carried, and what confirm-batch was asked for.
+	paths         []string
+	ownerSeen     map[string]string
+	confirmExpiry any
+	refuseExpiry  bool
+	deleted       []string
 }
 
 func newBatchServer() *batchServer {
@@ -35,17 +42,39 @@ func newBatchServer() *batchServer {
 		initErr:     map[int]bool{},
 		multipart:   map[int]bool{},
 		partsSeen:   map[string]int{},
+		ownerSeen:   map[string]string{},
 	}
 }
 
 func (b *batchServer) handler(t *testing.T, base *string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		b.paths = append(b.paths, r.Method+" "+r.URL.Path)
+		if tok := r.Header.Get("X-Owner-Token"); tok != "" {
+			b.ownerSeen[r.URL.Path] = tok
+		}
+		b.mu.Unlock()
 		switch {
 		case r.URL.Path == "/api/collection":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success":    true,
-				"collection": map[string]any{"id": "col1"},
+				"success":     true,
+				"collection":  map[string]any{"id": "col1", "url": "https://storage.to/c/col1"},
+				"owner_token": "owner-col1",
 			})
+		case r.URL.Path == "/api/collection/col1/expiry":
+			if b.refuseExpiry {
+				w.WriteHeader(403)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "Unauthorized"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "expires_at": "2026-09-01T00:00:00+00:00"})
+		case r.URL.Path == "/api/collection/col1/max-downloads":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "max_downloads": 1})
+		case r.URL.Path == "/api/collection/col1" && r.Method == "DELETE":
+			b.mu.Lock()
+			b.deleted = append(b.deleted, "col1")
+			b.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 		case strings.HasSuffix(r.URL.Path, "/ready"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"success":    true,
@@ -124,8 +153,12 @@ func (b *batchServer) handler(t *testing.T, base *string) http.HandlerFunc {
 				Files []struct {
 					R2Key string `json:"r2_key"`
 				} `json:"files"`
+				ExpiryDays any `json:"expiry_days"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			b.mu.Lock()
+			b.confirmExpiry = req.ExpiryDays
+			b.mu.Unlock()
 			results := map[string]any{}
 			for i, f := range req.Files {
 				b.mu.Lock()
@@ -225,5 +258,98 @@ func TestBatchMultipartFailureAborts(t *testing.T) {
 	defer b.mu.Unlock()
 	if len(b.aborted) == 0 {
 		t.Fatalf("failed multipart left an orphan R2 session: aborted=%v", b.aborted)
+	}
+}
+
+// The options reach the collection: expiry_days rides confirm-batch for the
+// member files, the collection row gets its own expiry and cap through the
+// management endpoints with the owner token, and all of it lands BEFORE
+// ready so the ready response carries the final expiry.
+func TestBatchOptionsAppliedBeforeReady(t *testing.T) {
+	b := newBatchServer()
+	var base string
+	srv := httptest.NewServer(b.handler(t, &base))
+	defer srv.Close()
+	base = srv.URL
+
+	u := NewUploader(api.NewClient(srv.URL, ""), false)
+	u.Options = Options{ExpiryDays: 7, MaxDownloads: 1}
+	res, err := u.uploadFilesBatch(context.Background(), makeFiles(t, 3, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.confirmExpiry != float64(7) {
+		t.Errorf("confirm-batch expiry_days = %v, want 7", b.confirmExpiry)
+	}
+	for _, p := range []string{"/api/collection/col1/expiry", "/api/collection/col1/max-downloads"} {
+		if b.ownerSeen[p] != "owner-col1" {
+			t.Errorf("%s owner token = %q, want owner-col1", p, b.ownerSeen[p])
+		}
+	}
+	idx := func(want string) int {
+		for i, p := range b.paths {
+			if p == want {
+				return i
+			}
+		}
+		t.Fatalf("%s never called: %v", want, b.paths)
+		return -1
+	}
+	ready := idx("POST /api/collection/col1/ready")
+	if idx("POST /api/collection/col1/expiry") > ready || idx("POST /api/collection/col1/max-downloads") > ready {
+		t.Errorf("management calls after ready: %v", b.paths)
+	}
+	if res.Collection.MaxDownloads != 1 {
+		t.Errorf("Collection.MaxDownloads = %d, want 1", res.Collection.MaxDownloads)
+	}
+	if len(b.deleted) != 0 {
+		t.Errorf("collection deleted on the happy path: %v", b.paths)
+	}
+}
+
+// Defaults change nothing on the wire.
+func TestBatchDefaultsSendNothingExtra(t *testing.T) {
+	b := newBatchServer()
+	var base string
+	srv := httptest.NewServer(b.handler(t, &base))
+	defer srv.Close()
+	base = srv.URL
+
+	u := NewUploader(api.NewClient(srv.URL, ""), false)
+	if _, err := u.uploadFilesBatch(context.Background(), makeFiles(t, 2, 4)); err != nil {
+		t.Fatal(err)
+	}
+	if b.confirmExpiry != nil {
+		t.Errorf("confirm-batch sent expiry_days by default: %v", b.confirmExpiry)
+	}
+	for _, p := range b.paths {
+		if strings.Contains(p, "/expiry") || strings.Contains(p, "max-downloads") || strings.HasPrefix(p, "DELETE") {
+			t.Errorf("unexpected management call %q", p)
+		}
+	}
+}
+
+// A collection that did not get its settings is removed, never handed out.
+func TestBatchOptionFailureRollsBack(t *testing.T) {
+	b := newBatchServer()
+	b.refuseExpiry = true
+	var base string
+	srv := httptest.NewServer(b.handler(t, &base))
+	defer srv.Close()
+	base = srv.URL
+
+	u := NewUploader(api.NewClient(srv.URL, ""), false)
+	u.Options = Options{ExpiryDays: 1}
+	_, err := u.uploadFilesBatch(context.Background(), makeFiles(t, 2, 4))
+	if err == nil || !strings.Contains(err.Error(), "upload removed") {
+		t.Fatalf("error = %v, want 'upload removed'", err)
+	}
+	if len(b.deleted) != 1 || b.ownerSeen["/api/collection/col1"] != "owner-col1" {
+		t.Errorf("collection not deleted with the owner token: %v", b.paths)
+	}
+	for _, p := range b.paths {
+		if strings.HasSuffix(p, "/ready") {
+			t.Errorf("ready was called after the settings failed: %v", b.paths)
+		}
 	}
 }

@@ -78,13 +78,30 @@ Press Ctrl+C to cancel - partial uploads are cleaned up automatically.
 
 ```
 Flags:
-  -c, --collection   Force collection even for single file
-  -v, --verbose      Show detailed progress
-      --json         Output result as JSON (for scripting)
-      --no-token     Run without persistent identity token
-      --api string   API endpoint (default "https://storage.to")
-  -h, --help         Show help
+  -c, --collection         Force collection even for single file
+      --expire string      Lifetime in days, 1d to 7d (default 3d)
+      --burn-after         Delete after the first download (same as --max-downloads 1)
+      --max-downloads int  Delete after this many downloads (1-1000)
+  -v, --verbose            Show detailed progress
+      --json               Output result as JSON (for scripting)
+      --no-token           Run without persistent identity token
+      --api string         API endpoint (default "https://storage.to")
+  -h, --help               Show help
 ```
+
+### Expiry and self-destruct
+
+```bash
+storageto upload secret.pdf --expire 1d          # gone after one day
+storageto upload secret.pdf --burn-after         # gone after the first download
+storageto upload build.zip --max-downloads 5     # gone after five downloads
+storageto upload *.log --expire 7d --burn-after  # works for collections too
+```
+
+`--expire` takes whole days from `1d` to `7d` (anything longer needs a
+storage.to account, which the CLI does not sign in to). A file or collection
+that could not be given the settings you asked for is deleted rather than
+handed out, and the command exits non-zero.
 
 ### JSON output
 
@@ -101,10 +118,14 @@ storageto upload photo.jpg --json
     "url": "https://storage.to/FQxyz1234",
     "size": 2097152,
     "human_size": "2.0 MB",
-    "expires_at": "2026-01-29T12:00:00Z"
+    "expires_at": "2026-01-29T12:00:00Z",
+    "max_downloads": 1
   }
 }
 ```
+
+`max_downloads` only appears when `--burn-after` or `--max-downloads` was
+given; `expires_at` always reflects the lifetime actually applied.
 
 ## Downloading Files
 
